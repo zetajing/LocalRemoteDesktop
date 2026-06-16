@@ -3,7 +3,6 @@ using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Windows;
-using LocalRemoteDesktop.Capture;
 using LocalRemoteDesktop.Utils;
 
 namespace LocalRemoteDesktop
@@ -78,8 +77,6 @@ namespace LocalRemoteDesktop
             _trayIcon.ContextMenuStrip = _trayMenu;
         }
 
-        private bool _secondaryMonitorMode;
-
         private void BuildMenu()
         {
             _trayMenu.Items.Clear();
@@ -103,12 +100,6 @@ namespace LocalRemoteDesktop
 
             _trayMenu.Items.Add(new System.Windows.Forms.ToolStripSeparator());
 
-            // 副屏模式开关
-            var extLabel = _secondaryMonitorMode ? "🟢 副屏模式运行中" : "🖥 启动副屏模式";
-            _trayMenu.Items.Add(extLabel, null, (s, ev) => ToggleSecondaryMonitorMode());
-
-            _trayMenu.Items.Add(new System.Windows.Forms.ToolStripSeparator());
-
             var localIp = GetLocalIp();
             if (!string.IsNullOrEmpty(localIp))
             {
@@ -129,22 +120,6 @@ namespace LocalRemoteDesktop
             };
             _trayMenu.Items.Add(autoStartItem);
 
-            // 驱动管理
-            var drvItem = new System.Windows.Forms.ToolStripMenuItem(
-                VirtualDisplayManager.IsInstalled() ? "✅ 虚拟显示器已安装" : "📦 安装虚拟显示器驱动");
-            drvItem.Click += (s, ev) =>
-            {
-                if (!VirtualDisplayManager.IsInstalled())
-                {
-                    MessageBox.Show("正在安装虚拟显示器驱动（需要管理员权限）...\n安装后需重启电脑生效。",
-                        "提示", MessageBoxButton.OK, MessageBoxImage.Information);
-                    VirtualDisplayManager.Install();
-                }
-                BuildMenu();
-                _trayIcon.ContextMenuStrip = _trayMenu;
-            };
-            _trayMenu.Items.Add(drvItem);
-
             _trayMenu.Items.Add(new System.Windows.Forms.ToolStripSeparator());
             _trayMenu.Items.Add("退出", null, (s, ev) =>
             {
@@ -152,50 +127,6 @@ namespace LocalRemoteDesktop
                 _serverRunner?.Dispose();
                 Shutdown();
             });
-        }
-
-        private void ToggleSecondaryMonitorMode()
-        {
-            if (_secondaryMonitorMode)
-            {
-                // 退出副屏模式：切回主屏(0)
-                _serverRunner?.SwitchToMonitor(0);
-                _secondaryMonitorMode = false;
-                _trayIcon.ShowBalloonTip(2000, "LocalRemoteDesktop",
-                    "已退出副屏模式", System.Windows.Forms.ToolTipIcon.Info);
-            }
-            else
-            {
-                if (ScreenCapture.GetMonitorCount() < 2)
-                {
-                    // 没有第二个显示器，尝试装驱动
-                    if (!VirtualDisplayManager.IsInstalled())
-                    {
-                        var result = MessageBox.Show(
-                            "副屏模式需要虚拟显示器驱动。是否立即安装？（需要管理员权限）",
-                            "安装驱动", MessageBoxButton.YesNo, MessageBoxImage.Question);
-                        if (result == MessageBoxResult.Yes)
-                            VirtualDisplayManager.Install();
-                    }
-                }
-
-                if (ScreenCapture.GetMonitorCount() < 2)
-                {
-                    MessageBox.Show("未检测到第二个显示器。请安装虚拟显示器驱动后重试。",
-                        "提示", MessageBoxButton.OK, MessageBoxImage.Warning);
-                    return;
-                }
-
-                // 切换到副屏（索引1）
-                _serverRunner?.SwitchToMonitor(1);
-                _secondaryMonitorMode = true;
-                _trayIcon.ShowBalloonTip(2000, "LocalRemoteDesktop",
-                    "副屏模式已启动\n请用另一台电脑连接此端口查看虚拟显示器画面",
-                    System.Windows.Forms.ToolTipIcon.Info);
-            }
-
-            BuildMenu();
-            _trayIcon.ContextMenuStrip = _trayMenu;
         }
 
         private void PromptConnect()
@@ -246,14 +177,14 @@ namespace LocalRemoteDesktop
                 {
                     g.Clear(System.Drawing.Color.Transparent);
 
-                    // 蓝色渐变圆形背景
+                    // 绿色渐变圆形背景
                     var brush = new System.Drawing.Drawing2D.LinearGradientBrush(
                         new System.Drawing.Point(0, 0), new System.Drawing.Point(size, size),
-                        System.Drawing.Color.FromArgb(0x1E, 0x90, 0xFF),  // 浅蓝
-                        System.Drawing.Color.FromArgb(0x0D, 0x47, 0xA1)); // 深蓝
+                        System.Drawing.Color.FromArgb(0x00, 0xC8, 0x53),  // 浅绿
+                        System.Drawing.Color.FromArgb(0x1B, 0x5E, 0x20)); // 深绿
                     g.FillEllipse(brush, 2, 2, size - 4, size - 4);
 
-                    // 白色 "LR" 文字
+                    // 白色 "MR" 文字
                     using (var font = new System.Drawing.Font("Arial", 14, System.Drawing.FontStyle.Bold))
                     using (var sf = new System.Drawing.StringFormat
                     {
@@ -261,7 +192,7 @@ namespace LocalRemoteDesktop
                         LineAlignment = System.Drawing.StringAlignment.Center
                     })
                     {
-                        g.DrawString("LR", font, System.Drawing.Brushes.White, new System.Drawing.RectangleF(2, 2, size - 4, size - 4), sf);
+                        g.DrawString("MR", font, System.Drawing.Brushes.White, new System.Drawing.RectangleF(2, 2, size - 4, size - 4), sf);
                     }
 
                     // 生成图标

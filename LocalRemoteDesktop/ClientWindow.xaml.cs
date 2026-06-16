@@ -17,8 +17,6 @@ namespace LocalRemoteDesktop
         private System.Windows.Forms.Screen _screen;
         private int _remoteWidth, _remoteHeight; // 远程桌面分辨率
         private bool _statsBarPinned; // F12 固定显示
-        private System.Windows.Media.Imaging.WriteableBitmap _tileCanvas; // Tile 拼接画布
-        private readonly object _tileLock = new object();
 
         // 帧率统计
         private int _frameCount;
@@ -138,9 +136,6 @@ namespace LocalRemoteDesktop
                         StatusText.Visibility = Visibility.Collapsed;
                     });
 
-                    // 发送本机分辨率，服务端可据此调整虚拟显示器
-                    SendClientResolution();
-
                     // 启动剪贴板同步（每 500ms 检测一次）
                     StartClipboardSync();
                 }
@@ -156,19 +151,6 @@ namespace LocalRemoteDesktop
             {
                 System.Diagnostics.Debug.WriteLine($"[Client] Connect error: {ex.Message}");
             }
-        }
-
-        private void SendClientResolution()
-        {
-            try
-            {
-                var screen = System.Windows.Forms.Screen.PrimaryScreen;
-                var payload = new byte[4];
-                Buffer.BlockCopy(BitConverter.GetBytes((ushort)screen.Bounds.Width), 0, payload, 0, 2);
-                Buffer.BlockCopy(BitConverter.GetBytes((ushort)screen.Bounds.Height), 0, payload, 2, 2);
-                _client?.Send(new ProtocolFrame(FrameType.ClientResolution, payload));
-            }
-            catch { }
         }
 
         private void OnFrameReceived(ProtocolFrame frame)
@@ -227,15 +209,17 @@ namespace LocalRemoteDesktop
                 {
                     using (var ms = new MemoryStream(frame.Payload))
                     {
-                        var bitmap = new System.Windows.Media.Imaging.BitmapImage();
-                        bitmap.BeginInit();
-                        bitmap.CacheOption = System.Windows.Media.Imaging.BitmapCacheOption.OnLoad;
-                        bitmap.StreamSource = ms;
-                        bitmap.EndInit();
-                        bitmap.Freeze();
-                        RemoteImage.Source = bitmap;
-                        _remoteWidth = bitmap.PixelWidth;
-                        _remoteHeight = bitmap.PixelHeight;
+                        var decoder = new System.Windows.Media.Imaging.JpegBitmapDecoder(
+                            ms,
+                            System.Windows.Media.Imaging.BitmapCreateOptions.None,
+                            System.Windows.Media.Imaging.BitmapCacheOption.OnLoad);
+                        var src = decoder.Frames[0];
+
+                        // 直接设为 Image.Source（比 WriteableBitmap 拼贴更简单高效）
+                        src.Freeze();
+                        RemoteImage.Source = src;
+                        _remoteWidth = src.PixelWidth;
+                        _remoteHeight = src.PixelHeight;
                     }
                 }
                 catch { }
@@ -256,7 +240,7 @@ namespace LocalRemoteDesktop
             }));
         }
 
-        #region Tile 流画面
+        #region 全帧 JPEG 画面（DXGI + 全帧编码）
 
         private void HandleScreenInfo(ProtocolFrame frame)
         {
@@ -267,67 +251,17 @@ namespace LocalRemoteDesktop
 
             _remoteWidth = w;
             _remoteHeight = h;
-
-            Dispatcher.BeginInvoke(new Action(() =>
-            {
-                try
-                {
-                    // 创建或重建 WriteableBitmap
-                    if (_tileCanvas == null || _tileCanvas.PixelWidth != w || _tileCanvas.PixelHeight != h)
-                    {
-                        _tileCanvas = new System.Windows.Media.Imaging.WriteableBitmap(
-                            w, h, 96, 96,
-                            System.Windows.Media.PixelFormats.Bgr32, null);
-                        RemoteImage.Source = _tileCanvas;
-                    }
-
-                    // 用黑色像素填充画布初始化
-                    int stride = w * 4;
-                    byte[] black = new byte[w * h * 4];
-                    _tileCanvas.WritePixels(new Int32Rect(0, 0, w, h), black, stride, 0);
-                }
-                catch { }
-            }), System.Windows.Threading.DispatcherPriority.Normal);
         }
 
         private void HandleTileImage(ProtocolFrame frame)
         {
-            if (frame.Payload.Length < 8) return;
-            var (tx, ty, tw, th, jpeg) = ProtocolFrame.ParseTile(frame.Payload);
-            if (tw <= 0 || th <= 0 || jpeg.Length == 0) return;
-
-            Dispatcher.BeginInvoke(new Action(() =>
-            {
-                try
-                {
-                    // 解码 JPEG（JPEG 解码为 Bgr24，需转 Bgr32 才能写入 WriteableBitmap）
-                    var decoder = new System.Windows.Media.Imaging.JpegBitmapDecoder(
-                        new MemoryStream(jpeg),
-                        System.Windows.Media.Imaging.BitmapCreateOptions.None,
-                        System.Windows.Media.Imaging.BitmapCacheOption.OnLoad);
-                    var src = decoder.Frames[0];
-
-                    // 转为 Bgr32 格式，匹配 WriteableBitmap
-                    var converted = new System.Windows.Media.Imaging.FormatConvertedBitmap(
-                        src, System.Windows.Media.PixelFormats.Bgr32, null, 0);
-
-                    // 直接写入 WriteableBitmap 的 (tx, ty) 位置
-                    if (_tileCanvas == null) return;
-                    int bpp = 4;
-                    int stride = tw * bpp;
-                    byte[] pixels = new byte[stride * th];
-                    converted.CopyPixels(new Int32Rect(0, 0, tw, th), pixels, stride, 0);
-
-                    // sourceRect = 目标矩形（WriteableBitmap 上的位置）
-                    _tileCanvas.WritePixels(new Int32Rect(tx, ty, tw, th), pixels, stride, 0);
-                }
-                catch { }
-            }), System.Windows.Threading.DispatcherPriority.Normal);
+            // 全帧 JPEG 数据：直接显示
+            DisplayImage(frame);
         }
 
         private void HandleTileEnd()
         {
-            // 不需要额外操作，WritePixels 已经实时更新显示
+            // 全帧模式下无需额外操作
         }
 
         #endregion

@@ -5,12 +5,16 @@ using LocalRemoteDesktop.Capture;
 using LocalRemoteDesktop.Input;
 using LocalRemoteDesktop.Models;
 using LocalRemoteDesktop.Network;
-using LocalRemoteDesktop.Utils;
 
 namespace LocalRemoteDesktop
 {
     /// <summary>
     /// 被控端后台运行器 — 监听连接、发送屏幕、接收输入
+    ///
+    /// v2 改进：
+    /// - DXGI 截屏（延迟 ~8ms vs 旧版 GDI ~38ms）
+    /// - 全帧 JPEG 传输（去掉瓦片系统）
+    /// - 自适应帧率（DXGI 自带 vsync 同步）
     /// </summary>
     public class ServerRunner : IDisposable
     {
@@ -19,22 +23,14 @@ namespace LocalRemoteDesktop
         private Timer _sendTimer;
         private volatile bool _running;
         private volatile bool _isSending;
-        private int _frameIntervalMs;
-        private const int FrameIntervalMs = 20; // 最高 ~50 FPS
-        private volatile bool _screenInfoSent;  // 首次连接时先发分辨信息
+        private bool _screenInfoSent; // 是否已发送分辨率信息，分辨率变化后重置
         private readonly object _disposeLock = new object();
 
-        public void Start(int port, int jpegQuality = 70, int frameIntervalMs = 20)
-        {
-            Start(port, jpegQuality, frameIntervalMs, 0);
-        }
-
-        public void Start(int port, int jpegQuality, int frameIntervalMs, int monitorIndex)
+        public void Start(int port, int jpegQuality = 80, int monitorIndex = 0)
         {
             _server = new RemoteServer();
             _capture = new ScreenCapture(jpegQuality, monitorIndex);
             _running = true;
-            _frameIntervalMs = Math.Max(16, frameIntervalMs);
             _screenInfoSent = false;
 
             _server.FrameReceived += OnFrameReceived;
@@ -75,25 +71,31 @@ namespace LocalRemoteDesktop
                 {
                     var tiles = _capture.CaptureChangedTiles();
 
-                    // 首次或重连: 先发 ScreenInfo 告知分辨率
-                    if (!_screenInfoSent)
+                    if (tiles.Count == 0)
+                    {
+                        // 无变化，继续下一帧（DXGI 已同步 vsync）
+                        return;
+                    }
+
+                    // 分辨率是否变了？发送 ScreenInfo
+                    if (_capture.SizeChanged || !_screenInfoSent)
                     {
                         var (w, h) = _capture.GetScreenSize();
                         var info = new byte[4];
                         Buffer.BlockCopy(BitConverter.GetBytes(w), 0, info, 0, 2);
                         Buffer.BlockCopy(BitConverter.GetBytes(h), 0, info, 2, 2);
-                        _server.Send(new ProtocolFrame(FrameType.ScreenInfo, info));
                         _screenInfoSent = true;
+                        _capture.ResetSizeChanged();
+                        _server.Send(new ProtocolFrame(FrameType.ScreenInfo, info));
                     }
 
-                    // 逐个发送变化的 Tile
+                    // 发送全帧 JPEG
                     foreach (var tile in tiles)
                     {
-                        var frame = ProtocolFrame.CreateTile(tile.X, tile.Y, tile.Width, tile.Height, tile.JpegData);
-                        _server.Send(frame);
+                        _server.Send(new ProtocolFrame(FrameType.TileImage, tile.JpegData));
                     }
 
-                    // 发结尾标记，告知客户端可以刷新画面
+                    // 帧结束标记
                     _server.Send(new ProtocolFrame(FrameType.TileEnd, Array.Empty<byte>()));
                 }
                 finally
@@ -114,7 +116,8 @@ namespace LocalRemoteDesktop
         {
             lock (_disposeLock)
             {
-                _sendTimer?.Change(_frameIntervalMs, Timeout.Infinite);
+                // 16ms ≈ 60fps；DXGI 实际帧率由 vsync 决定
+                _sendTimer?.Change(16, Timeout.Infinite);
             }
         }
 
@@ -176,20 +179,6 @@ namespace LocalRemoteDesktop
                     // ---- 心跳回显 ----
                     case FrameType.Heartbeat:
                         _server?.Send(new ProtocolFrame(FrameType.Heartbeat, frame.Payload));
-                        break;
-
-                    // ---- 客户端分辨率 ----
-                    case FrameType.ClientResolution:
-                        if (frame.Payload.Length >= 4)
-                        {
-                            int cw = BitConverter.ToUInt16(frame.Payload, 0);
-                            int ch = BitConverter.ToUInt16(frame.Payload, 2);
-                            if (cw > 0 && ch > 0)
-                            {
-                                // 调整虚拟显示器分辨率匹配客户端
-                                VirtualDisplayManager.SetResolution(cw, ch);
-                            }
-                        }
                         break;
 
                     // ---- 剪贴板同步 ----

@@ -60,8 +60,5 @@ namespace LocalRemoteDesktop.Models
 
         /// <summary>Tile本帧发送完毕 (Server → Client) 通知客户端刷新画面</summary>
         TileEnd = 0x22,
-
-        /// <summary>客户端分辨率通知 (Client → Server) payload: [2byte W][2byte H]</summary>
-        ClientResolution = 0x23,
     }
 }
