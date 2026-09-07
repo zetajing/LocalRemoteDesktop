@@ -31,13 +31,23 @@ namespace LocalRemoteDesktop
 
         public void Start(int port, string accessCode, int jpegQuality = 80, int monitorIndex = 0)
         {
+            Start(port, accessCode, true, jpegQuality, monitorIndex);
+        }
+
+        public void Start(
+            int port,
+            string accessCode,
+            bool accessCodeEnabled,
+            int jpegQuality = 80,
+            int monitorIndex = 0)
+        {
             _server = new RemoteServer();
             _capture = new ScreenCapture(jpegQuality, monitorIndex);
             _running = true;
             _screenInfoSent = false;
 
             _server.FrameReceived += OnFrameReceived;
-            _server.Start(port, accessCode);
+            _server.Start(port, accessCode, accessCodeEnabled);
 
             // 首次立即触发，之后每帧完成后才安排下一帧（绝不重叠）
             _sendTimer = new Timer(SendScreenFrame, null, 0, Timeout.Infinite);

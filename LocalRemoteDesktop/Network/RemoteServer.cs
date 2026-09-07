@@ -32,7 +32,7 @@ namespace LocalRemoteDesktop.Network
             {
                 Stream.Close();
                 Client.Close();
-                Session.Dispose();
+                Session?.Dispose();
             }
         }
 
@@ -44,12 +44,13 @@ namespace LocalRemoteDesktop.Network
         private AuthenticatedConnection _connection;
         private Thread _acceptThread;
         private byte[] _preSharedKey;
+        private bool _accessCodeEnabled;
         private bool _running;
         private bool _disposed;
 
         public event Action<ProtocolFrame> FrameReceived;
 
-        /// <summary>仅当挑战响应认证成功并建立安全会话后才为 true。</summary>
+        /// <summary>仅当建立业务连接后才为 true。</summary>
         public bool IsConnected
         {
             get
@@ -61,10 +62,17 @@ namespace LocalRemoteDesktop.Network
 
         public void Start(int port, string accessCode)
         {
+            Start(port, accessCode, true);
+        }
+
+        public void Start(int port, string accessCode, bool accessCodeEnabled)
+        {
             if (port < 1 || port > 65535)
                 throw new ArgumentOutOfRangeException(nameof(port));
 
-            var preSharedKey = SecurityPrimitives.DerivePreSharedKey(accessCode);
+            byte[] preSharedKey = accessCodeEnabled
+                ? SecurityPrimitives.DerivePreSharedKey(accessCode)
+                : null;
             TcpListener listener = null;
             try
             {
@@ -79,6 +87,7 @@ namespace LocalRemoteDesktop.Network
                         throw new InvalidOperationException("服务端已经启动。");
 
                     _preSharedKey = preSharedKey;
+                    _accessCodeEnabled = accessCodeEnabled;
                     _listener = listener;
                     _running = true;
                 }
@@ -125,9 +134,12 @@ namespace LocalRemoteDesktop.Network
                     pendingClient.NoDelay = true;
                     pendingStream = pendingClient.GetStream();
 
-                    session = SecureHandshake.AuthenticateServer(
-                        pendingStream,
-                        handshakeKey);
+                    if (IsAccessCodeEnabled())
+                    {
+                        session = SecureHandshake.AuthenticateServer(
+                            pendingStream,
+                            handshakeKey);
+                    }
 
                     var connection = new AuthenticatedConnection(
                         pendingClient,
@@ -168,7 +180,7 @@ namespace LocalRemoteDesktop.Network
                     }
 
                     System.Diagnostics.Debug.WriteLine(
-                        "[RemoteServer] Authenticated client connected");
+                        "[RemoteServer] Client connected");
                 }
                 catch (ObjectDisposedException)
                 {
@@ -203,11 +215,20 @@ namespace LocalRemoteDesktop.Network
             {
                 while (IsCurrentConnection(connection))
                 {
-                    var secureFrame = ProtocolFrame.ReadFrom(connection.Stream);
-                    if (secureFrame.Type != FrameType.SecureData)
-                        throw new InvalidOperationException("认证后收到非加密协议帧。");
+                    var incomingFrame = ProtocolFrame.ReadFrom(connection.Stream);
+                    ProtocolFrame businessFrame;
+                    if (connection.Session != null)
+                    {
+                        if (incomingFrame.Type != FrameType.SecureData)
+                            throw new InvalidOperationException("认证后收到非加密协议帧。");
 
-                    var businessFrame = connection.Session.Unprotect(secureFrame);
+                        businessFrame = connection.Session.Unprotect(incomingFrame);
+                    }
+                    else
+                    {
+                        businessFrame = incomingFrame;
+                    }
+
                     FrameReceived?.Invoke(businessFrame);
                 }
             }
@@ -240,8 +261,9 @@ namespace LocalRemoteDesktop.Network
 
                 try
                 {
-                    var secureFrame = connection.Session.Protect(frame);
-                    var data = secureFrame.Serialize();
+                    var data = connection.Session == null
+                        ? frame.Serialize()
+                        : connection.Session.Protect(frame).Serialize();
                     connection.Stream.Write(data, 0, data.Length);
                     connection.Stream.Flush();
                 }
@@ -277,6 +299,7 @@ namespace LocalRemoteDesktop.Network
                 _connection = null;
                 _acceptThread = null;
                 _preSharedKey = null;
+                _accessCodeEnabled = false;
             }
 
             listener?.Stop();
@@ -291,13 +314,19 @@ namespace LocalRemoteDesktop.Network
                 return _running;
         }
 
+        private bool IsAccessCodeEnabled()
+        {
+            lock (_stateLock)
+                return _accessCodeEnabled;
+        }
+
         private bool RegisterPendingClient(
             TcpClient client,
             out byte[] handshakeKey)
         {
             lock (_stateLock)
             {
-                if (!_running || _preSharedKey == null)
+                if (!_running || (_accessCodeEnabled && _preSharedKey == null))
                 {
                     handshakeKey = null;
                     client.Close();
@@ -305,7 +334,9 @@ namespace LocalRemoteDesktop.Network
                 }
 
                 _pendingClient = client;
-                handshakeKey = (byte[])_preSharedKey.Clone();
+                handshakeKey = _accessCodeEnabled
+                    ? (byte[])_preSharedKey.Clone()
+                    : null;
                 return true;
             }
         }

@@ -21,6 +21,7 @@ namespace LocalRemoteDesktop
         private bool _statsBarPinned; // F12 固定显示
         private readonly string _targetHost;
         private readonly int _targetPort;
+        private readonly bool _accessCodeEnabled;
         private string _accessCode;
         private volatile bool _isClosing;
 
@@ -36,16 +37,22 @@ namespace LocalRemoteDesktop
         private long _lastHeartbeatSentAt; // 上次心跳发送时 Stopwatch ticks
 
         public ClientWindow(string host, int port, string accessCode)
+            : this(host, port, accessCode, true)
+        {
+        }
+
+        public ClientWindow(string host, int port, string accessCode, bool accessCodeEnabled)
         {
             if (string.IsNullOrWhiteSpace(host))
                 throw new ArgumentException("远程主机不能为空。", nameof(host));
             if (port < 1 || port > 65535)
                 throw new ArgumentOutOfRangeException(nameof(port));
-            if (string.IsNullOrWhiteSpace(accessCode))
+            if (accessCodeEnabled && string.IsNullOrWhiteSpace(accessCode))
                 throw new ArgumentException("访问码不能为空。", nameof(accessCode));
 
             _targetHost = host;
             _targetPort = port;
+            _accessCodeEnabled = accessCodeEnabled;
             _accessCode = accessCode;
 
             InitializeComponent();
@@ -150,7 +157,8 @@ namespace LocalRemoteDesktop
                 _client.FrameReceived += OnFrameReceived;
                 _client.Disconnected += OnDisconnected;
 
-                if (_client.Connect(_targetHost, _targetPort, _accessCode))
+                if (_client.Connect(
+                    _targetHost, _targetPort, _accessCode, _accessCodeEnabled))
                 {
                     _accessCode = null;
                     if (_isClosing)

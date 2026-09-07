@@ -17,6 +17,7 @@ namespace LocalRemoteDesktop
         private System.Windows.Forms.NotifyIcon _trayIcon;
         private System.Windows.Forms.ContextMenuStrip _trayMenu;
         private string _accessCode;
+        private bool _accessCodeEnabled;
 
         protected override void OnStartup(StartupEventArgs e)
         {
@@ -40,9 +41,10 @@ namespace LocalRemoteDesktop
             };
 
             // 自动启动被控端（后台监听）
+            _accessCodeEnabled = AccessCodeStore.IsEnabled();
             _accessCode = AccessCodeStore.GetOrCreate();
             _serverRunner = new ServerRunner();
-            _serverRunner.Start(DefaultPort, _accessCode);
+            _serverRunner.Start(DefaultPort, _accessCode, _accessCodeEnabled);
 
             // 生成动态图标
             GenerateIcon();
@@ -82,6 +84,10 @@ namespace LocalRemoteDesktop
         private void BuildMenu()
         {
             _trayMenu.Items.Clear();
+            var visibleAccessCode = _accessCode ?? AccessCodeStore.GetOrCreate();
+            _trayIcon.Text = _accessCodeEnabled
+                ? $"LocalRemoteDesktop (访问码 {visibleAccessCode})"
+                : "LocalRemoteDesktop (访问码未启用)";
 
             _trayMenu.Items.Add("🔗 连接远程电脑...", null, (s, ev) => PromptConnect());
 
@@ -109,8 +115,23 @@ namespace LocalRemoteDesktop
                 ipItem.Enabled = false;
                 _trayMenu.Items.Add(ipItem);
             }
-            _trayMenu.Items.Add("复制本机访问码", null, (s, ev) => CopyAccessCode());
+            var accessCodeItem = new System.Windows.Forms.ToolStripMenuItem(
+                _accessCodeEnabled
+                    ? $"🔑 本机访问码: {visibleAccessCode}"
+                    : "🔓 访问码：未启用");
+            accessCodeItem.Enabled = false;
+            _trayMenu.Items.Add(accessCodeItem);
+
+            var copyAccessCodeItem = new System.Windows.Forms.ToolStripMenuItem("复制本机访问码");
+            copyAccessCodeItem.Enabled = _accessCodeEnabled;
+            copyAccessCodeItem.Click += (s, ev) => CopyAccessCode();
+            _trayMenu.Items.Add(copyAccessCodeItem);
             _trayMenu.Items.Add("重新生成本机访问码...", null, (s, ev) => RegenerateAccessCode());
+
+            var accessCodeEnabledItem = new System.Windows.Forms.ToolStripMenuItem(
+                _accessCodeEnabled ? "✅ 启用访问码" : "☐ 启用访问码");
+            accessCodeEnabledItem.Click += (s, ev) => ToggleAccessCode();
+            _trayMenu.Items.Add(accessCodeEnabledItem);
             _trayMenu.Items.Add(new System.Windows.Forms.ToolStripSeparator());
 
             bool autoStartOn = IsAutoStartEnabled();
@@ -140,18 +161,24 @@ namespace LocalRemoteDesktop
                 var dialog = new ConnectDialog(initialHost, initialPort ?? DefaultPort);
                 if (dialog.ShowDialog() == true)
                 {
-                    ConnectTo(dialog.Host, dialog.Port, dialog.AccessCode);
+                    ConnectTo(dialog.Host, dialog.Port, dialog.AccessCode,
+                        dialog.AccessCodeEnabled);
                 }
             });
         }
 
-        private void ConnectTo(string host, int port, string accessCode)
+        private void ConnectTo(
+            string host,
+            int port,
+            string accessCode,
+            bool accessCodeEnabled)
         {
             ConnectionHistory.Add(host, port);
 
             Dispatcher.Invoke(() =>
             {
-                var clientWindow = new ClientWindow(host, port, accessCode);
+                var clientWindow = new ClientWindow(
+                    host, port, accessCode, accessCodeEnabled);
                 clientWindow.Show();
             });
         }
@@ -162,6 +189,13 @@ namespace LocalRemoteDesktop
             {
                 try
                 {
+                    if (!_accessCodeEnabled)
+                    {
+                        MessageBox.Show("访问码功能当前未启用。", "复制访问码",
+                            MessageBoxButton.OK, MessageBoxImage.Information);
+                        return;
+                    }
+
                     var accessCode = _accessCode ?? AccessCodeStore.GetOrCreate();
                     if (!ClipboardHelper.TrySetText(accessCode))
                         throw new InvalidOperationException("剪贴板当前被其他程序占用，重试后仍无法打开。");
@@ -195,7 +229,9 @@ namespace LocalRemoteDesktop
                     _accessCode = AccessCodeStore.Regenerate();
                     _serverRunner?.Dispose();
                     _serverRunner = new ServerRunner();
-                    _serverRunner.Start(DefaultPort, _accessCode);
+                    _serverRunner.Start(DefaultPort, _accessCode, _accessCodeEnabled);
+                    BuildMenu();
+                    _trayIcon.ContextMenuStrip = _trayMenu;
                     _trayIcon?.ShowBalloonTip(2500, "LocalRemoteDesktop",
                         "已生成新的本机访问码。可从托盘菜单复制。",
                         System.Windows.Forms.ToolTipIcon.Info);
@@ -203,6 +239,51 @@ namespace LocalRemoteDesktop
                 catch (Exception ex)
                 {
                     MessageBox.Show($"重新生成访问码失败:\n{ex.Message}", "错误",
+                        MessageBoxButton.OK, MessageBoxImage.Error);
+                }
+            });
+        }
+
+        private void ToggleAccessCode()
+        {
+            Dispatcher.Invoke(() =>
+            {
+                var newEnabled = !_accessCodeEnabled;
+                if (!newEnabled)
+                {
+                    var result = MessageBox.Show(
+                        "关闭访问码后，任何能访问本机端口 8932 的设备都可以直接连接，是否继续？",
+                        "关闭访问码",
+                        MessageBoxButton.YesNo,
+                        MessageBoxImage.Warning);
+                    if (result != MessageBoxResult.Yes)
+                        return;
+                }
+
+                var oldEnabled = _accessCodeEnabled;
+                try
+                {
+                    if (newEnabled)
+                        _accessCode = _accessCode ?? AccessCodeStore.GetOrCreate();
+
+                    _accessCodeEnabled = newEnabled;
+                    AccessCodeStore.SetEnabled(newEnabled);
+                    _serverRunner?.Dispose();
+                    _serverRunner = new ServerRunner();
+                    _serverRunner.Start(DefaultPort, _accessCode, _accessCodeEnabled);
+                    BuildMenu();
+                    _trayIcon.ContextMenuStrip = _trayMenu;
+                    _trayIcon.ShowBalloonTip(2500, "LocalRemoteDesktop",
+                        newEnabled ? "访问码已启用。" : "访问码已关闭，当前端口无需访问码即可连接。",
+                        newEnabled
+                            ? System.Windows.Forms.ToolTipIcon.Info
+                            : System.Windows.Forms.ToolTipIcon.Warning);
+                }
+                catch (Exception ex)
+                {
+                    _accessCodeEnabled = oldEnabled;
+                    try { AccessCodeStore.SetEnabled(oldEnabled); } catch { }
+                    MessageBox.Show($"切换访问码功能失败:\n{ex.Message}", "错误",
                         MessageBoxButton.OK, MessageBoxImage.Error);
                 }
             });

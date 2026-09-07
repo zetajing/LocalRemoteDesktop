@@ -34,11 +34,17 @@
 
         <TextBlock Grid.Row="2" Grid.Column="0"
                    Text="访问码" VerticalAlignment="Center" Margin="0,0,10,6"/>
-        <PasswordBox x:Name="AccessCodeBox" Grid.Row="2" Grid.Column="1"
-                     Height="28" Margin="0,0,0,6" VerticalContentAlignment="Center"/>
+        <StackPanel Grid.Row="2" Grid.Column="1"
+                    Orientation="Horizontal" Margin="0,0,0,6">
+            <CheckBox x:Name="UseAccessCodeCheckBox"
+                      Content="启用访问码" IsChecked="True"
+                      VerticalAlignment="Center" Margin="0,0,8,0"/>
+            <TextBox x:Name="AccessCodeBox" Width="166" Height="28"
+                     VerticalContentAlignment="Center"/>
+        </StackPanel>
 
         <TextBlock Grid.Row="3" Grid.Column="1"
-                   Text="访问码仅用于本次连接，不会保存到最近连接。"
+                   Text="需与远程端设置一致；访问码明文显示，仅用于本次连接。"
                    Foreground="#666" FontSize="12" Margin="0,0,0,18"/>
 
         <StackPanel Grid.Row="4" Grid.ColumnSpan="2"

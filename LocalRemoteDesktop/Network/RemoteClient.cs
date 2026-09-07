@@ -7,7 +7,7 @@ using LocalRemoteDesktop.Security;
 namespace LocalRemoteDesktop.Network
 {
     /// <summary>
-    /// 控制端。只有访问码挑战响应完成后才进入已连接状态，所有业务帧均通过安全外层传输。
+    /// 控制端。启用访问码时完成挑战响应；关闭访问码时直接传输协议帧。
     /// </summary>
     public class RemoteClient : IDisposable
     {
@@ -26,17 +26,22 @@ namespace LocalRemoteDesktop.Network
         public event Action<ProtocolFrame> FrameReceived;
         public event Action Disconnected;
 
-        /// <summary>TCP 建立但认证尚未完成时仍为 false。</summary>
+        /// <summary>TCP 建立并进入业务传输状态后为 true。</summary>
         public bool IsConnected
         {
             get
             {
                 lock (_stateLock)
-                    return _running && _session != null;
+                    return _running && _client != null;
             }
         }
 
         public bool Connect(string host, int port, string accessCode)
+        {
+            return Connect(host, port, accessCode, true);
+        }
+
+        public bool Connect(string host, int port, string accessCode, bool accessCodeEnabled)
         {
             lock (_connectLock)
             {
@@ -49,7 +54,7 @@ namespace LocalRemoteDesktop.Network
                 {
                     lock (_stateLock)
                     {
-                        if (_disposed || _running || _session != null)
+                        if (_disposed || _running || _client != null)
                             return false;
                     }
 
@@ -68,7 +73,8 @@ namespace LocalRemoteDesktop.Network
                     stream = client.GetStream();
 
                     // 握手在当前线程完成；认证成功前不启动业务接收，也不触发 FrameReceived。
-                    session = SecureHandshake.AuthenticateClient(stream, accessCode);
+                    if (accessCodeEnabled)
+                        session = SecureHandshake.AuthenticateClient(stream, accessCode);
 
                     var receiveThread = new Thread(
                         () => ReceiveLoop(client, stream, session))
@@ -128,11 +134,20 @@ namespace LocalRemoteDesktop.Network
             {
                 while (IsCurrentConnection(client, session))
                 {
-                    var secureFrame = ProtocolFrame.ReadFrom(stream);
-                    if (secureFrame.Type != FrameType.SecureData)
-                        throw new InvalidOperationException("认证后收到非加密协议帧。");
+                    var incomingFrame = ProtocolFrame.ReadFrom(stream);
+                    ProtocolFrame businessFrame;
+                    if (session != null)
+                    {
+                        if (incomingFrame.Type != FrameType.SecureData)
+                            throw new InvalidOperationException("认证后收到非加密协议帧。");
 
-                    var businessFrame = session.Unprotect(secureFrame);
+                        businessFrame = session.Unprotect(incomingFrame);
+                    }
+                    else
+                    {
+                        businessFrame = incomingFrame;
+                    }
+
                     FrameReceived?.Invoke(businessFrame);
                 }
             }
@@ -147,7 +162,7 @@ namespace LocalRemoteDesktop.Network
             }
         }
 
-        /// <summary>发送一帧数据（线程安全，始终经 SecureData 外层传输）。</summary>
+        /// <summary>发送一帧数据（线程安全；启用访问码时使用 SecureData）。</summary>
         public void Send(ProtocolFrame frame)
         {
             TcpClient client;
@@ -158,7 +173,7 @@ namespace LocalRemoteDesktop.Network
             {
                 lock (_stateLock)
                 {
-                    if (!_running || _session == null)
+                    if (!_running || _client == null)
                         return;
 
                     client = _client;
@@ -168,8 +183,9 @@ namespace LocalRemoteDesktop.Network
 
                 try
                 {
-                    var secureFrame = session.Protect(frame);
-                    var data = secureFrame.Serialize();
+                    var data = session == null
+                        ? frame.Serialize()
+                        : session.Protect(frame).Serialize();
                     stream.Write(data, 0, data.Length);
                     stream.Flush();
                 }

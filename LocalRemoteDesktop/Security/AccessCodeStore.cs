@@ -6,11 +6,14 @@ using System.Text;
 namespace LocalRemoteDesktop.Security
 {
     /// <summary>
-    /// 为本机生成并保存 256 位随机访问码。访问码是预共享密钥，不能记录到日志。
+    /// 为本机生成并保存短格式随机访问码。访问码是预共享密钥，不能记录到日志。
     /// </summary>
     public static class AccessCodeStore
     {
-        private const int AccessCodeBytes = 32;
+        private const int AccessCodeLength = 8;
+        // 去掉 I/O/0/1，避免远程口述或查看时混淆；字符集长度为 32。
+        private const string AccessCodeAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+        private const string EnabledFileName = "access-code-enabled";
         private static readonly object SyncRoot = new object();
 
         public static string GetOrCreate()
@@ -37,18 +40,46 @@ namespace LocalRemoteDesktop.Security
             }
         }
 
+        public static bool IsEnabled()
+        {
+            lock (SyncRoot)
+            {
+                var path = GetEnabledStoragePath();
+                if (!File.Exists(path))
+                    return true;
+
+                var value = File.ReadAllText(path, Encoding.UTF8).Trim();
+                if (string.Equals(value, "0", StringComparison.Ordinal) ||
+                    string.Equals(value, "false", StringComparison.OrdinalIgnoreCase))
+                {
+                    return false;
+                }
+
+                return true;
+            }
+        }
+
+        public static void SetEnabled(bool enabled)
+        {
+            lock (SyncRoot)
+            {
+                WriteSafely(GetEnabledStoragePath(), enabled ? "1" : "0");
+            }
+        }
+
         private static string RegenerateCore(string path)
         {
-            var random = new byte[AccessCodeBytes];
+            var random = new byte[AccessCodeLength];
             using (var rng = new RNGCryptoServiceProvider())
                 rng.GetBytes(random);
 
             try
             {
-                var accessCode = Convert.ToBase64String(random)
-                    .TrimEnd('=')
-                    .Replace('+', '-')
-                    .Replace('/', '_');
+                var accessCodeChars = new char[AccessCodeLength];
+                for (var i = 0; i < accessCodeChars.Length; i++)
+                    accessCodeChars[i] = AccessCodeAlphabet[random[i] % AccessCodeAlphabet.Length];
+
+                var accessCode = new string(accessCodeChars);
 
                 WriteSafely(path, accessCode);
                 return accessCode;
@@ -102,21 +133,21 @@ namespace LocalRemoteDesktop.Security
             return Path.Combine(localData, "LocalRemoteDesktop", "access-code");
         }
 
+        private static string GetEnabledStoragePath()
+        {
+            var localData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            return Path.Combine(localData, "LocalRemoteDesktop", EnabledFileName);
+        }
+
         private static bool IsGeneratedAccessCode(string value)
         {
-            if (value == null || value.Length != 43)
+            if (value == null || value.Length != AccessCodeLength)
                 return false;
 
             for (var i = 0; i < value.Length; i++)
             {
-                var c = value[i];
-                if ((c >= 'A' && c <= 'Z') ||
-                    (c >= 'a' && c <= 'z') ||
-                    (c >= '0' && c <= '9') ||
-                    c == '-' || c == '_')
-                {
+                if (AccessCodeAlphabet.IndexOf(value[i]) >= 0)
                     continue;
-                }
 
                 return false;
             }
