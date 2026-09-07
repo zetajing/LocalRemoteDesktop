@@ -2,132 +2,257 @@ using System;
 using System.Net.Sockets;
 using System.Threading;
 using LocalRemoteDesktop.Models;
+using LocalRemoteDesktop.Security;
 
 namespace LocalRemoteDesktop.Network
 {
     /// <summary>
-    /// 控制端 — 连接被控端，接收屏幕帧，发送输入事件
+    /// 控制端。只有访问码挑战响应完成后才进入已连接状态，所有业务帧均通过安全外层传输。
     /// </summary>
     public class RemoteClient : IDisposable
     {
+        private readonly object _stateLock = new object();
+        private readonly object _connectLock = new object();
+        private readonly object _sendLock = new object();
+
         private TcpClient _client;
         private NetworkStream _stream;
+        private SecureSession _session;
         private Thread _receiveThread;
-        private volatile bool _running;
-        private readonly byte[] _recvBuffer = new byte[1024 * 512]; // 512KB 接收缓冲区
-        private int _recvOffset;
-        private readonly object _sendLock = new object();
+        private bool _running;
+        private bool _disposed;
+        private int _disconnectSignaled;
 
         public event Action<ProtocolFrame> FrameReceived;
         public event Action Disconnected;
 
-        public bool IsConnected => _client?.Connected ?? false;
-
-        public bool Connect(string ip, int port)
+        /// <summary>TCP 建立但认证尚未完成时仍为 false。</summary>
+        public bool IsConnected
         {
-            try
+            get
             {
-                _client = new TcpClient();
-                _client.ReceiveTimeout = 10000;
-                _client.SendTimeout = 5000;
-                _client.Connect(ip, port);
-                _client.NoDelay = true; // 禁用 Nagle 算法，减少小包延迟
-                _stream = _client.GetStream();
-                _running = true;
-
-                _receiveThread = new Thread(ReceiveLoop)
-                {
-                    IsBackground = true,
-                    Name = "ClientReceive"
-                };
-                _receiveThread.Start();
-
-                return true;
-            }
-            catch (Exception ex)
-            {
-                System.Diagnostics.Debug.WriteLine($"[RemoteClient] Connect failed: {ex.Message}");
-                return false;
+                lock (_stateLock)
+                    return _running && _session != null;
             }
         }
 
-        private void ReceiveLoop()
+        public bool Connect(string host, int port, string accessCode)
+        {
+            lock (_connectLock)
+            {
+                TcpClient client = null;
+                NetworkStream stream = null;
+                SecureSession session = null;
+                var ownershipTransferred = false;
+
+                try
+                {
+                    lock (_stateLock)
+                    {
+                        if (_disposed || _running || _session != null)
+                            return false;
+                    }
+
+                    if (string.IsNullOrWhiteSpace(host))
+                        throw new ArgumentException("远程主机不能为空。", nameof(host));
+                    if (port < 1 || port > 65535)
+                        throw new ArgumentOutOfRangeException(nameof(port));
+
+                    client = new TcpClient
+                    {
+                        ReceiveTimeout = 10000,
+                        SendTimeout = 5000,
+                        NoDelay = true
+                    };
+                    client.Connect(host, port);
+                    stream = client.GetStream();
+
+                    // 握手在当前线程完成；认证成功前不启动业务接收，也不触发 FrameReceived。
+                    session = SecureHandshake.AuthenticateClient(stream, accessCode);
+
+                    var receiveThread = new Thread(
+                        () => ReceiveLoop(client, stream, session))
+                    {
+                        IsBackground = true,
+                        Name = "ClientSecureReceive"
+                    };
+
+                    lock (_stateLock)
+                    {
+                        if (_disposed)
+                            throw new ObjectDisposedException(nameof(RemoteClient));
+
+                        _client = client;
+                        _stream = stream;
+                        _session = session;
+                        _receiveThread = receiveThread;
+                        _running = true;
+                        Interlocked.Exchange(ref _disconnectSignaled, 0);
+                        ownershipTransferred = true;
+                    }
+
+                    try
+                    {
+                        receiveThread.Start();
+                    }
+                    catch
+                    {
+                        DisconnectConnection(client, session, false);
+                        throw;
+                    }
+
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        $"[RemoteClient] Connect/authentication failed: {ex.Message}");
+
+                    if (!ownershipTransferred)
+                    {
+                        session?.Dispose();
+                        stream?.Close();
+                        client?.Close();
+                    }
+                    return false;
+                }
+            }
+        }
+
+        private void ReceiveLoop(
+            TcpClient client,
+            NetworkStream stream,
+            SecureSession session)
         {
             try
             {
-                while (_running && _client?.Connected == true)
+                while (IsCurrentConnection(client, session))
                 {
-                    var available = _recvBuffer.Length - _recvOffset;
-                    if (available <= 0)
-                    {
-                        // 缓冲区满了且无法解析出完整帧 — 可能协议出错，断开连接
-                        System.Diagnostics.Debug.WriteLine("[RemoteClient] Buffer full, disconnecting");
-                        break;
-                    }
+                    var secureFrame = ProtocolFrame.ReadFrom(stream);
+                    if (secureFrame.Type != FrameType.SecureData)
+                        throw new InvalidOperationException("认证后收到非加密协议帧。");
 
-                    var read = _stream.Read(_recvBuffer, _recvOffset, available);
-                    if (read <= 0) break;
-
-                    _recvOffset += read;
-
-                    int consumed = 0;
-                    while (true)
-                    {
-                        var frame = ProtocolFrame.Deserialize(_recvBuffer, consumed, _recvOffset - consumed);
-                        if (frame == null) break;
-
-                        consumed += 5 + frame.Payload.Length;
-                        FrameReceived?.Invoke(frame);
-                    }
-
-                    if (consumed > 0)
-                    {
-                        var remaining = _recvOffset - consumed;
-                        if (remaining > 0)
-                            Buffer.BlockCopy(_recvBuffer, consumed, _recvBuffer, 0, remaining);
-                        _recvOffset = remaining;
-                    }
+                    var businessFrame = session.Unprotect(secureFrame);
+                    FrameReceived?.Invoke(businessFrame);
                 }
             }
             catch (Exception ex)
             {
-                System.Diagnostics.Debug.WriteLine($"[RemoteClient] Receive error: {ex.Message}");
+                System.Diagnostics.Debug.WriteLine(
+                    $"[RemoteClient] Secure receive failed: {ex.Message}");
             }
-
-            _running = false;
-            Disconnected?.Invoke();
+            finally
+            {
+                DisconnectConnection(client, session, true);
+            }
         }
 
-        /// <summary>发送一帧数据（线程安全）</summary>
+        /// <summary>发送一帧数据（线程安全，始终经 SecureData 外层传输）。</summary>
         public void Send(ProtocolFrame frame)
         {
-            if (!IsConnected) return;
+            TcpClient client;
+            NetworkStream stream;
+            SecureSession session;
 
-            try
+            lock (_sendLock)
             {
-                var data = frame.Serialize();
-                lock (_sendLock)
+                lock (_stateLock)
                 {
-                    _stream?.Write(data, 0, data.Length);
-                    _stream?.Flush();
+                    if (!_running || _session == null)
+                        return;
+
+                    client = _client;
+                    stream = _stream;
+                    session = _session;
                 }
-            }
-            catch (Exception ex)
-            {
-                System.Diagnostics.Debug.WriteLine($"[RemoteClient] Send error: {ex.Message}");
+
+                try
+                {
+                    var secureFrame = session.Protect(frame);
+                    var data = secureFrame.Serialize();
+                    stream.Write(data, 0, data.Length);
+                    stream.Flush();
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        $"[RemoteClient] Secure send failed: {ex.Message}");
+                    DisconnectConnection(client, session, true);
+                }
             }
         }
 
         public void Dispose()
         {
-            _running = false;
-            var s = _stream;
-            _stream = null;
-            s?.Close();
+            TcpClient client;
+            NetworkStream stream;
+            SecureSession session;
 
-            var c = _client;
-            _client = null;
-            c?.Close();
+            lock (_stateLock)
+            {
+                if (_disposed)
+                    return;
+
+                _disposed = true;
+                _running = false;
+                client = _client;
+                stream = _stream;
+                session = _session;
+                _client = null;
+                _stream = null;
+                _session = null;
+                _receiveThread = null;
+            }
+
+            stream?.Close();
+            client?.Close();
+            session?.Dispose();
+        }
+
+        private bool IsCurrentConnection(
+            TcpClient client,
+            SecureSession session)
+        {
+            lock (_stateLock)
+            {
+                return _running &&
+                       ReferenceEquals(_client, client) &&
+                       ReferenceEquals(_session, session);
+            }
+        }
+
+        private void DisconnectConnection(
+            TcpClient client,
+            SecureSession session,
+            bool notify)
+        {
+            NetworkStream stream = null;
+            var wasCurrent = false;
+
+            lock (_stateLock)
+            {
+                if (ReferenceEquals(_client, client) &&
+                    ReferenceEquals(_session, session))
+                {
+                    wasCurrent = _running;
+                    _running = false;
+                    stream = _stream;
+                    _client = null;
+                    _stream = null;
+                    _session = null;
+                    _receiveThread = null;
+                }
+            }
+
+            stream?.Close();
+            client?.Close();
+            session?.Dispose();
+
+            if (notify && wasCurrent &&
+                Interlocked.Exchange(ref _disconnectSignaled, 1) == 0)
+            {
+                Disconnected?.Invoke();
+            }
         }
     }
 }

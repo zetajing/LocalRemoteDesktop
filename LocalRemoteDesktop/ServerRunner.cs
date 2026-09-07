@@ -5,6 +5,7 @@ using LocalRemoteDesktop.Capture;
 using LocalRemoteDesktop.Input;
 using LocalRemoteDesktop.Models;
 using LocalRemoteDesktop.Network;
+using LocalRemoteDesktop.Utils;
 
 namespace LocalRemoteDesktop
 {
@@ -21,12 +22,14 @@ namespace LocalRemoteDesktop
         private RemoteServer _server;
         private ScreenCapture _capture;
         private Timer _sendTimer;
+        private int _clipboardPollInProgress;
         private volatile bool _running;
         private volatile bool _isSending;
         private bool _screenInfoSent; // 是否已发送分辨率信息，分辨率变化后重置
         private readonly object _disposeLock = new object();
+        private bool _disposed;
 
-        public void Start(int port, int jpegQuality = 80, int monitorIndex = 0)
+        public void Start(int port, string accessCode, int jpegQuality = 80, int monitorIndex = 0)
         {
             _server = new RemoteServer();
             _capture = new ScreenCapture(jpegQuality, monitorIndex);
@@ -34,7 +37,7 @@ namespace LocalRemoteDesktop
             _screenInfoSent = false;
 
             _server.FrameReceived += OnFrameReceived;
-            _server.Start(port);
+            _server.Start(port, accessCode);
 
             // 首次立即触发，之后每帧完成后才安排下一帧（绝不重叠）
             _sendTimer = new Timer(SendScreenFrame, null, 0, Timeout.Infinite);
@@ -59,6 +62,7 @@ namespace LocalRemoteDesktop
 
                 if (!_server.IsConnected)
                 {
+                    AbortActiveFileTransfer(false, null);
                     _screenInfoSent = false;
                     ScheduleNextFrame();
                     return;
@@ -208,114 +212,385 @@ namespace LocalRemoteDesktop
 
         #region 文件接收
 
-        private string _receivingFileName;
+        private readonly object _fileReceiveLock = new object();
+        private string _receivingRelativePath;
+        private string _receivingDestinationPath;
+        private string _receivingTempPath;
         private FileStream _receivingFileStream;
-
         private long _receivingFileExpectedSize;
         private long _receivingFileBytesWritten;
+        private int _receivingNextSequence;
+        private bool _fileTerminalResultSent;
 
         private void HandleFileRequest(ProtocolFrame frame)
         {
-            if (frame.Payload.Length < 10) // 至少 8字节大小 + 1字节标志 + 1字节文件名
+            lock (_fileReceiveLock)
             {
-                _server?.Send(new ProtocolFrame(FrameType.FileReject, Array.Empty<byte>()));
-                return;
-            }
-
-            // 解析：前8字节为文件大小，第9字节为标志，后面为相对路径/文件名
-            _receivingFileExpectedSize = BitConverter.ToInt64(frame.Payload, 0);
-            _receivingFileBytesWritten = 0;
-            bool isFolderFile = frame.Payload[8] != 0;
-            var rawPath = System.Text.Encoding.UTF8.GetString(frame.Payload, 9, frame.Payload.Length - 9);
-
-            // 安全处理：提取安全的相对路径
-            var safePath = Path.GetFileName(rawPath);
-            var rawDir = Path.GetDirectoryName(rawPath);
-            if (!string.IsNullOrWhiteSpace(rawDir))
-            {
-                var dirParts = rawDir.Split(new[] { '\\', '/' }, StringSplitOptions.RemoveEmptyEntries);
-                var safeParts = new System.Collections.Generic.List<string>();
-                foreach (var p in dirParts)
+                if (_receivingFileStream != null)
                 {
-                    if (string.IsNullOrWhiteSpace(p) || p.Contains("..")) continue;
-                    safeParts.Add(p);
+                    RejectFileRequest("服务端正在接收另一个文件");
+                    return;
                 }
-                if (safeParts.Count > 0)
-                    safePath = Path.Combine(string.Join("\\", safeParts), safePath);
-            }
 
-            if (string.IsNullOrWhiteSpace(safePath))
-            {
-                _server?.Send(new ProtocolFrame(FrameType.FileReject, Array.Empty<byte>()));
-                return;
-            }
+                _fileTerminalResultSent = false;
+                if (frame.Payload.Length < 10)
+                {
+                    RejectFileRequest("文件请求格式无效");
+                    return;
+                }
 
-            // 保存到桌面下的子目录
-            var desktop = Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
-            _receivingFileName = Path.Combine(desktop, safePath);
+                var expectedSize = BitConverter.ToInt64(frame.Payload, 0);
+                if (expectedSize < 0 || frame.Payload[8] > 1)
+                {
+                    RejectFileRequest("文件大小或类型无效");
+                    return;
+                }
 
-            // 如果是文件夹传输，确保目录存在
-            var dir = Path.GetDirectoryName(_receivingFileName);
-            if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
-                Directory.CreateDirectory(dir);
+                string rawPath;
+                try
+                {
+                    rawPath = new System.Text.UTF8Encoding(false, true).GetString(
+                        frame.Payload, 9, frame.Payload.Length - 9);
+                }
+                catch (System.Text.DecoderFallbackException)
+                {
+                    RejectFileRequest("文件路径编码无效");
+                    return;
+                }
 
-            // 避免重名
-            int count = 1;
-            var baseName = _receivingFileName;
-            while (File.Exists(_receivingFileName))
-            {
-                var name = Path.GetFileNameWithoutExtension(baseName);
-                var ext = Path.GetExtension(baseName);
-                _receivingFileName = Path.Combine(desktop, $"{name} ({count++}){ext}");
-            }
+                string relativePath;
+                string destinationPath;
+                string error;
+                if (!TryResolveDesktopPath(rawPath, out relativePath, out destinationPath, out error))
+                {
+                    RejectFileRequest(error);
+                    return;
+                }
 
-            try
-            {
-                // 关闭上一个可能未结束的文件流，防止泄漏
-                _receivingFileStream?.Dispose();
-                _receivingFileStream = new FileStream(_receivingFileName, FileMode.Create, FileAccess.Write);
-                _server?.Send(new ProtocolFrame(FrameType.FileAccept, Array.Empty<byte>()));
-                System.Diagnostics.Debug.WriteLine($"[Server] Receiving file: {_receivingFileName}");
-            }
-            catch (Exception ex)
-            {
-                System.Diagnostics.Debug.WriteLine($"[Server] File reject: {ex.Message}");
-                _server?.Send(new ProtocolFrame(FrameType.FileReject, Array.Empty<byte>()));
+                try
+                {
+                    var destinationDirectory = Path.GetDirectoryName(destinationPath);
+                    Directory.CreateDirectory(destinationDirectory);
+
+                    var tempPath = Path.Combine(destinationDirectory,
+                        ".lrd-" + Guid.NewGuid().ToString("N") + ".tmp");
+                    var stream = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write,
+                        FileShare.None, 256 * 1024, FileOptions.SequentialScan);
+
+                    _receivingRelativePath = relativePath;
+                    _receivingDestinationPath = destinationPath;
+                    _receivingTempPath = tempPath;
+                    _receivingFileStream = stream;
+                    _receivingFileExpectedSize = expectedSize;
+                    _receivingFileBytesWritten = 0;
+                    _receivingNextSequence = 0;
+
+                    _server?.Send(new ProtocolFrame(FrameType.FileAccept, Array.Empty<byte>()));
+                    System.Diagnostics.Debug.WriteLine(
+                        $"[Server] Receiving file: {_receivingRelativePath}");
+                }
+                catch (Exception ex)
+                {
+                    CleanupReceivingFileUnsafe();
+                    System.Diagnostics.Debug.WriteLine($"[Server] File reject: {ex.Message}");
+                    RejectFileRequest("无法创建接收文件");
+                }
             }
         }
 
         private void HandleFileData(ProtocolFrame frame)
         {
-            if (_receivingFileStream == null || frame.Payload.Length < 4) return;
+            lock (_fileReceiveLock)
+            {
+                if (_receivingFileStream == null)
+                    return;
+                if (frame.Payload.Length < 4)
+                {
+                    FailActiveFileTransfer("文件数据块格式无效");
+                    return;
+                }
 
-            // 跳过4字节序号
-            var dataLen = frame.Payload.Length - 4;
-            _receivingFileStream?.Write(frame.Payload, 4, dataLen);
-            _receivingFileBytesWritten += dataLen;
+                var sequence = BitConverter.ToInt32(frame.Payload, 0);
+                if (sequence != _receivingNextSequence)
+                {
+                    FailActiveFileTransfer(
+                        $"文件数据块序号错误，应为 {_receivingNextSequence}，实际为 {sequence}");
+                    return;
+                }
+
+                var dataLength = frame.Payload.Length - 4;
+                if (_receivingFileBytesWritten > _receivingFileExpectedSize - dataLength)
+                {
+                    FailActiveFileTransfer("接收数据超过声明的文件大小");
+                    return;
+                }
+
+                try
+                {
+                    _receivingFileStream.Write(frame.Payload, 4, dataLength);
+                    _receivingFileBytesWritten += dataLength;
+                    _receivingNextSequence++;
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"[Server] File write error: {ex.Message}");
+                    FailActiveFileTransfer("写入接收文件失败");
+                }
+            }
         }
 
         private void HandleFileEnd()
         {
-            try
+            lock (_fileReceiveLock)
             {
-                _receivingFileStream?.Flush();
-                _receivingFileStream?.Dispose();
-                _receivingFileStream = null;
-
-                // 校验接收大小
-                if (_receivingFileExpectedSize > 0 && _receivingFileBytesWritten != _receivingFileExpectedSize)
+                if (_receivingFileStream == null)
                 {
-                    System.Diagnostics.Debug.WriteLine(
-                        $"[Server] File size mismatch: expected {_receivingFileExpectedSize}, got {_receivingFileBytesWritten}");
+                    if (!_fileTerminalResultSent)
+                    {
+                        _fileTerminalResultSent = true;
+                        SendTransferResult(false, "没有正在接收的文件");
+                    }
+                    return;
                 }
 
-                System.Diagnostics.Debug.WriteLine(
-                    $"[Server] File saved: {_receivingFileName} ({_receivingFileBytesWritten} bytes)");
+                if (_receivingFileBytesWritten != _receivingFileExpectedSize)
+                {
+                    var message =
+                        $"文件大小不一致，应为 {_receivingFileExpectedSize} 字节，实际为 {_receivingFileBytesWritten} 字节";
+                    System.Diagnostics.Debug.WriteLine($"[Server] {message}");
+                    FailActiveFileTransfer(message);
+                    return;
+                }
+
+                try
+                {
+                    _receivingFileStream.Flush(true);
+                    _receivingFileStream.Dispose();
+                    _receivingFileStream = null;
+
+                    var finalPath = MoveTempFileAtomically(
+                        _receivingTempPath, _receivingDestinationPath);
+                    var savedName = Path.GetFileName(finalPath);
+                    var savedBytes = _receivingFileBytesWritten;
+
+                    ClearReceivingStateUnsafe();
+                    _fileTerminalResultSent = true;
+                    SendTransferResult(true, $"发送完成，已保存到桌面: {savedName}");
+                    System.Diagnostics.Debug.WriteLine(
+                        $"[Server] File saved: {savedName} ({savedBytes} bytes)");
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"[Server] File save error: {ex.Message}");
+                    FailActiveFileTransfer("保存接收文件失败");
+                }
             }
-            catch (Exception ex)
+        }
+
+        private static bool TryResolveDesktopPath(string rawPath, out string relativePath,
+            out string destinationPath, out string error)
+        {
+            relativePath = null;
+            destinationPath = null;
+            error = null;
+
+            try
             {
-                System.Diagnostics.Debug.WriteLine($"[Server] File save error: {ex.Message}");
+                if (string.IsNullOrWhiteSpace(rawPath) || Path.IsPathRooted(rawPath))
+                {
+                    error = "文件路径必须是安全的相对路径";
+                    return false;
+                }
+
+                var parts = rawPath.Replace('/', '\\').Split(
+                    new[] { '\\' }, StringSplitOptions.None);
+                if (parts.Length == 0)
+                {
+                    error = "文件路径为空";
+                    return false;
+                }
+
+                var invalidChars = Path.GetInvalidFileNameChars();
+                foreach (var part in parts)
+                {
+                    if (string.IsNullOrWhiteSpace(part) || part == "." || part == ".." ||
+                        part.IndexOfAny(invalidChars) >= 0 ||
+                        part.EndsWith(" ", StringComparison.Ordinal) ||
+                        part.EndsWith(".", StringComparison.Ordinal) ||
+                        IsReservedWindowsName(part))
+                    {
+                        error = "文件路径包含不安全的目录或文件名";
+                        return false;
+                    }
+                }
+
+                var desktop = Path.GetFullPath(
+                    Environment.GetFolderPath(Environment.SpecialFolder.Desktop));
+                var desktopPrefix = desktop.TrimEnd(Path.DirectorySeparatorChar,
+                    Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+                relativePath = string.Join(Path.DirectorySeparatorChar.ToString(), parts);
+                destinationPath = Path.GetFullPath(Path.Combine(desktop, relativePath));
+
+                if (!destinationPath.StartsWith(desktopPrefix,
+                    StringComparison.OrdinalIgnoreCase))
+                {
+                    relativePath = null;
+                    destinationPath = null;
+                    error = "文件路径超出桌面目录";
+                    return false;
+                }
+
+                return true;
             }
+            catch (Exception ex) when (ex is ArgumentException ||
+                                       ex is NotSupportedException ||
+                                       ex is PathTooLongException)
+            {
+                relativePath = null;
+                destinationPath = null;
+                error = "文件路径无效或过长";
+                return false;
+            }
+        }
+
+        private static bool IsReservedWindowsName(string pathPart)
+        {
+            var name = Path.GetFileNameWithoutExtension(pathPart);
+            if (string.IsNullOrEmpty(name))
+                return false;
+
+            switch (name.ToUpperInvariant())
+            {
+                case "CON":
+                case "PRN":
+                case "AUX":
+                case "NUL":
+                case "COM1":
+                case "COM2":
+                case "COM3":
+                case "COM4":
+                case "COM5":
+                case "COM6":
+                case "COM7":
+                case "COM8":
+                case "COM9":
+                case "LPT1":
+                case "LPT2":
+                case "LPT3":
+                case "LPT4":
+                case "LPT5":
+                case "LPT6":
+                case "LPT7":
+                case "LPT8":
+                case "LPT9":
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        private static string MoveTempFileAtomically(string tempPath, string desiredPath)
+        {
+            var directory = Path.GetDirectoryName(desiredPath);
+            var name = Path.GetFileNameWithoutExtension(desiredPath);
+            var extension = Path.GetExtension(desiredPath);
+
+            for (var suffix = 0; suffix < 10000; suffix++)
+            {
+                var candidate = suffix == 0
+                    ? desiredPath
+                    : Path.Combine(directory, $"{name} ({suffix}){extension}");
+                try
+                {
+                    File.Move(tempPath, candidate);
+                    return candidate;
+                }
+                catch (IOException)
+                {
+                    if (File.Exists(candidate) || Directory.Exists(candidate))
+                        continue;
+                    throw;
+                }
+            }
+
+            throw new IOException("无法为接收文件分配不重复的名称");
+        }
+
+        private void RejectFileRequest(string message)
+        {
+            var payload = System.Text.Encoding.UTF8.GetBytes(message ?? "文件传输被拒绝");
+            _server?.Send(new ProtocolFrame(FrameType.FileReject, payload));
+        }
+
+        private void FailActiveFileTransfer(string message)
+        {
+            CleanupReceivingFileUnsafe();
+            _fileTerminalResultSent = true;
+            SendTransferResult(false, message);
+        }
+
+        private void AbortActiveFileTransfer(bool sendResult, string message)
+        {
+            lock (_fileReceiveLock)
+            {
+                if (_receivingFileStream == null && string.IsNullOrEmpty(_receivingTempPath))
+                    return;
+
+                CleanupReceivingFileUnsafe();
+                if (sendResult)
+                {
+                    _fileTerminalResultSent = true;
+                    SendTransferResult(false, message ?? "文件传输已中止");
+                }
+            }
+        }
+
+        private void CleanupReceivingFileUnsafe()
+        {
+            try
+            {
+                _receivingFileStream?.Dispose();
+            }
+            catch
+            {
+            }
+            _receivingFileStream = null;
+
+            if (!string.IsNullOrEmpty(_receivingTempPath))
+            {
+                try
+                {
+                    if (File.Exists(_receivingTempPath))
+                        File.Delete(_receivingTempPath);
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        $"[Server] Temporary file cleanup failed: {ex.Message}");
+                }
+            }
+
+            ClearReceivingStateUnsafe();
+        }
+
+        private void ClearReceivingStateUnsafe()
+        {
+            _receivingRelativePath = null;
+            _receivingDestinationPath = null;
+            _receivingTempPath = null;
+            _receivingFileStream = null;
+            _receivingFileExpectedSize = 0;
+            _receivingFileBytesWritten = 0;
+            _receivingNextSequence = 0;
+        }
+
+        private void SendTransferResult(bool succeeded, string message)
+        {
+            var messageBytes = System.Text.Encoding.UTF8.GetBytes(message ?? string.Empty);
+            var payload = new byte[1 + messageBytes.Length];
+            payload[0] = succeeded ? (byte)1 : (byte)0;
+            Buffer.BlockCopy(messageBytes, 0, payload, 1, messageBytes.Length);
+            _server?.Send(new ProtocolFrame(FrameType.FileTransferResult, payload));
         }
 
         #endregion
@@ -330,6 +605,9 @@ namespace LocalRemoteDesktop
             _clipboardTimer = new Timer(_ =>
             {
                 if (!_running || !_server.IsConnected) return;
+                if (Interlocked.Exchange(ref _clipboardPollInProgress, 1) != 0)
+                    return;
+
                 try
                 {
                     // 在 STA 线程上访问剪贴板
@@ -337,9 +615,9 @@ namespace LocalRemoteDesktop
                     {
                         try
                         {
-                            if (System.Windows.Forms.Clipboard.ContainsText())
+                            string text;
+                            if (ClipboardHelper.TryGetText(out text))
                             {
-                                var text = System.Windows.Forms.Clipboard.GetText();
                                 if (!string.IsNullOrEmpty(text) && text != _lastServerClipboard)
                                 {
                                     _lastServerClipboard = text;
@@ -355,6 +633,10 @@ namespace LocalRemoteDesktop
                     staThread.Join(1000); // 最多等1秒
                 }
                 catch { }
+                finally
+                {
+                    Interlocked.Exchange(ref _clipboardPollInProgress, 0);
+                }
             }, null, 1000, 500); // 1秒后开始，每500ms
         }
 
@@ -368,7 +650,7 @@ namespace LocalRemoteDesktop
                     _lastServerClipboard = text;
                     System.Threading.Thread staThread = new System.Threading.Thread(() =>
                     {
-                        try { System.Windows.Forms.Clipboard.SetText(text); }
+                        try { ClipboardHelper.TrySetText(text); }
                         catch { }
                     });
                     staThread.SetApartmentState(System.Threading.ApartmentState.STA);
@@ -385,16 +667,24 @@ namespace LocalRemoteDesktop
         {
             lock (_disposeLock)
             {
+                if (_disposed)
+                    return;
+                _disposed = true;
                 _running = false;
+
                 var t = _sendTimer;
                 _sendTimer = null;
                 t?.Dispose();
+
+                var clipboardTimer = _clipboardTimer;
+                _clipboardTimer = null;
+                clipboardTimer?.Dispose();
+
+                AbortActiveFileTransfer(false, null);
+                if (_server != null)
+                    _server.FrameReceived -= OnFrameReceived;
                 _server?.Dispose();
                 _capture?.Dispose();
-
-                // 清理可能残留的文件接收流
-                _receivingFileStream?.Dispose();
-                _receivingFileStream = null;
             }
         }
     }

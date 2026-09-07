@@ -3,165 +3,362 @@ using System.Net;
 using System.Net.Sockets;
 using System.Threading;
 using LocalRemoteDesktop.Models;
+using LocalRemoteDesktop.Security;
 
 namespace LocalRemoteDesktop.Network
 {
     /// <summary>
-    /// 被控端 — 监听连接，发送屏幕帧，接收输入事件
+    /// 被控端。未通过访问码挑战响应的 TCP 连接不会成为当前连接，也不会分发业务帧。
     /// </summary>
     public class RemoteServer : IDisposable
     {
-        private TcpListener _listener;
-        private TcpClient _client;
-        private NetworkStream _stream;
-        private Thread _acceptThread;
-        private Thread _receiveThread;
+        private sealed class AuthenticatedConnection : IDisposable
+        {
+            internal readonly TcpClient Client;
+            internal readonly NetworkStream Stream;
+            internal readonly SecureSession Session;
+
+            internal AuthenticatedConnection(
+                TcpClient client,
+                NetworkStream stream,
+                SecureSession session)
+            {
+                Client = client;
+                Stream = stream;
+                Session = session;
+            }
+
+            public void Dispose()
+            {
+                Stream.Close();
+                Client.Close();
+                Session.Dispose();
+            }
+        }
+
+        private readonly object _stateLock = new object();
         private readonly object _sendLock = new object();
-        private volatile bool _running;
-        // 需大于最大入站帧：文件传输 256KB 数据块 + 9 字节开销 ≈ 257KB
-        private readonly byte[] _recvBuffer = new byte[1024 * 300]; // 300KB
-        private int _recvOffset;
+
+        private TcpListener _listener;
+        private TcpClient _pendingClient;
+        private AuthenticatedConnection _connection;
+        private Thread _acceptThread;
+        private byte[] _preSharedKey;
+        private bool _running;
+        private bool _disposed;
 
         public event Action<ProtocolFrame> FrameReceived;
 
-        public bool IsConnected => _client?.Connected ?? false;
-
-        public void Start(int port)
+        /// <summary>仅当挑战响应认证成功并建立安全会话后才为 true。</summary>
+        public bool IsConnected
         {
-            _running = true;
-            _listener = new TcpListener(IPAddress.Any, port);
-            _listener.Start();
-
-            _acceptThread = new Thread(AcceptLoop)
+            get
             {
-                IsBackground = true,
-                Name = "ServerAccept"
-            };
-            _acceptThread.Start();
+                lock (_stateLock)
+                    return _running && _connection != null;
+            }
         }
 
-        private void AcceptLoop()
+        public void Start(int port, string accessCode)
         {
-            while (_running)
+            if (port < 1 || port > 65535)
+                throw new ArgumentOutOfRangeException(nameof(port));
+
+            var preSharedKey = SecurityPrimitives.DerivePreSharedKey(accessCode);
+            TcpListener listener = null;
+            try
             {
+                listener = new TcpListener(IPAddress.Any, port);
+                listener.Start();
+
+                lock (_stateLock)
+                {
+                    if (_disposed)
+                        throw new ObjectDisposedException(nameof(RemoteServer));
+                    if (_running)
+                        throw new InvalidOperationException("服务端已经启动。");
+
+                    _preSharedKey = preSharedKey;
+                    _listener = listener;
+                    _running = true;
+                }
+
+                // 闭包必须捕获稳定的局部副本；下面会将 listener 置空以转移所有权。
+                var listenerForThread = listener;
+                var acceptThread = new Thread(() => AcceptLoop(listenerForThread))
+                {
+                    IsBackground = true,
+                    Name = "ServerSecureAccept"
+                };
+                lock (_stateLock)
+                    _acceptThread = acceptThread;
+
+                acceptThread.Start();
+                preSharedKey = null; // 所有权已转交给实例
+                listener = null;
+            }
+            finally
+            {
+                listener?.Stop();
+                SecurityPrimitives.Clear(preSharedKey);
+            }
+        }
+
+        private void AcceptLoop(TcpListener listener)
+        {
+            while (IsRunning())
+            {
+                TcpClient pendingClient = null;
+                NetworkStream pendingStream = null;
+                SecureSession session = null;
+                byte[] handshakeKey = null;
+                var promoted = false;
+
                 try
                 {
-                    // 同步等待连接（可被 _listener.Stop() 中断抛出异常）
-                    var client = _listener.AcceptTcpClient();
-                    if (!_running)
+                    pendingClient = listener.AcceptTcpClient();
+                    if (!RegisterPendingClient(pendingClient, out handshakeKey))
+                        break;
+
+                    pendingClient.ReceiveTimeout = 10000;
+                    pendingClient.SendTimeout = 5000;
+                    pendingClient.NoDelay = true;
+                    pendingStream = pendingClient.GetStream();
+
+                    session = SecureHandshake.AuthenticateServer(
+                        pendingStream,
+                        handshakeKey);
+
+                    var connection = new AuthenticatedConnection(
+                        pendingClient,
+                        pendingStream,
+                        session);
+                    AuthenticatedConnection previous;
+                    if (!PromotePendingClient(
+                        pendingClient,
+                        connection,
+                        out previous))
                     {
-                        client.Close();
+                        connection.Dispose();
+                        session = null;
+                        pendingStream = null;
+                        pendingClient = null;
                         break;
                     }
 
-                    // 替换旧连接
-                    var old = Interlocked.Exchange(ref _client, client);
-                    old?.Close();
+                    promoted = true;
+                    session = null;
+                    pendingStream = null;
+                    pendingClient = null;
+                    previous?.Dispose();
 
-                    _client.ReceiveTimeout = 10000;
-                    _client.SendTimeout = 5000;
-                    _client.NoDelay = true; // 禁用 Nagle 算法
-                    _stream = _client.GetStream();
-                    _recvOffset = 0;
-
-                    // 启动接收线程
-                    _receiveThread = new Thread(ReceiveLoop)
+                    var receiveThread = new Thread(() => ReceiveLoop(connection))
                     {
                         IsBackground = true,
-                        Name = "ServerReceive"
+                        Name = "ServerSecureReceive"
                     };
-                    _receiveThread.Start();
+                    try
+                    {
+                        receiveThread.Start();
+                    }
+                    catch
+                    {
+                        RemoveConnection(connection);
+                        throw;
+                    }
 
-                    System.Diagnostics.Debug.WriteLine("[RemoteServer] Client connected");
+                    System.Diagnostics.Debug.WriteLine(
+                        "[RemoteServer] Authenticated client connected");
                 }
                 catch (ObjectDisposedException)
                 {
-                    // _listener 已释放，正常退出
-                    break;
+                    if (!IsRunning())
+                        break;
                 }
                 catch (Exception ex)
                 {
-                    System.Diagnostics.Debug.WriteLine($"[RemoteServer] Accept error: {ex.Message}");
+                    if (IsRunning())
+                    {
+                        System.Diagnostics.Debug.WriteLine(
+                            $"[RemoteServer] Accept/authentication failed: {ex.Message}");
+                    }
+                }
+                finally
+                {
+                    SecurityPrimitives.Clear(handshakeKey);
+                    if (!promoted)
+                    {
+                        ClearPendingClient(pendingClient);
+                        session?.Dispose();
+                        pendingStream?.Close();
+                        pendingClient?.Close();
+                    }
                 }
             }
         }
 
-        private void ReceiveLoop()
+        private void ReceiveLoop(AuthenticatedConnection connection)
         {
             try
             {
-                while (_running && _client?.Connected == true)
+                while (IsCurrentConnection(connection))
                 {
-                    var available = _recvBuffer.Length - _recvOffset;
-                    if (available <= 0)
-                    {
-                        System.Diagnostics.Debug.WriteLine("[RemoteServer] Receive buffer full, disconnecting");
-                        break;
-                    }
+                    var secureFrame = ProtocolFrame.ReadFrom(connection.Stream);
+                    if (secureFrame.Type != FrameType.SecureData)
+                        throw new InvalidOperationException("认证后收到非加密协议帧。");
 
-                    var read = _stream.Read(_recvBuffer, _recvOffset, available);
-                    if (read <= 0) break;
-
-                    _recvOffset += read;
-
-                    int consumed = 0;
-                    while (true)
-                    {
-                        var frame = ProtocolFrame.Deserialize(_recvBuffer, consumed, _recvOffset - consumed);
-                        if (frame == null) break;
-
-                        consumed += 5 + frame.Payload.Length;
-                        FrameReceived?.Invoke(frame);
-                    }
-
-                    if (consumed > 0)
-                    {
-                        var remaining = _recvOffset - consumed;
-                        if (remaining > 0)
-                            Buffer.BlockCopy(_recvBuffer, consumed, _recvBuffer, 0, remaining);
-                        _recvOffset = remaining;
-                    }
+                    var businessFrame = connection.Session.Unprotect(secureFrame);
+                    FrameReceived?.Invoke(businessFrame);
                 }
             }
             catch (Exception ex)
             {
-                System.Diagnostics.Debug.WriteLine($"[RemoteServer] Receive error: {ex.Message}");
+                if (IsRunning())
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        $"[RemoteServer] Secure receive failed: {ex.Message}");
+                }
+            }
+            finally
+            {
+                RemoveConnection(connection);
             }
         }
 
-        /// <summary>发送一帧数据（线程安全）</summary>
+        /// <summary>发送一帧数据（线程安全，始终经 SecureData 外层传输）。</summary>
         public void Send(ProtocolFrame frame)
         {
-            if (!IsConnected) return;
-
-            try
+            lock (_sendLock)
             {
-                var data = frame.Serialize();
-                lock (_sendLock)
+                AuthenticatedConnection connection;
+                lock (_stateLock)
                 {
-                    _stream?.Write(data, 0, data.Length);
-                    _stream?.Flush();
+                    if (!_running || _connection == null)
+                        return;
+                    connection = _connection;
                 }
-            }
-            catch (Exception ex)
-            {
-                System.Diagnostics.Debug.WriteLine($"[RemoteServer] Send error: {ex.Message}");
+
+                try
+                {
+                    var secureFrame = connection.Session.Protect(frame);
+                    var data = secureFrame.Serialize();
+                    connection.Stream.Write(data, 0, data.Length);
+                    connection.Stream.Flush();
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine(
+                        $"[RemoteServer] Secure send failed: {ex.Message}");
+                    RemoveConnection(connection);
+                }
             }
         }
 
         public void Dispose()
         {
-            _running = false;
+            TcpListener listener;
+            TcpClient pendingClient;
+            AuthenticatedConnection connection;
+            byte[] preSharedKey;
 
-            var s = _stream;
-            _stream = null;
-            s?.Close();
+            lock (_stateLock)
+            {
+                if (_disposed)
+                    return;
 
-            var c = _client;
-            _client = null;
-            c?.Close();
+                _disposed = true;
+                _running = false;
+                listener = _listener;
+                pendingClient = _pendingClient;
+                connection = _connection;
+                preSharedKey = _preSharedKey;
+                _listener = null;
+                _pendingClient = null;
+                _connection = null;
+                _acceptThread = null;
+                _preSharedKey = null;
+            }
 
-            _listener?.Stop();
+            listener?.Stop();
+            pendingClient?.Close();
+            connection?.Dispose();
+            SecurityPrimitives.Clear(preSharedKey);
+        }
+
+        private bool IsRunning()
+        {
+            lock (_stateLock)
+                return _running;
+        }
+
+        private bool RegisterPendingClient(
+            TcpClient client,
+            out byte[] handshakeKey)
+        {
+            lock (_stateLock)
+            {
+                if (!_running || _preSharedKey == null)
+                {
+                    handshakeKey = null;
+                    client.Close();
+                    return false;
+                }
+
+                _pendingClient = client;
+                handshakeKey = (byte[])_preSharedKey.Clone();
+                return true;
+            }
+        }
+
+        private bool PromotePendingClient(
+            TcpClient pendingClient,
+            AuthenticatedConnection connection,
+            out AuthenticatedConnection previous)
+        {
+            lock (_stateLock)
+            {
+                if (!_running || !ReferenceEquals(_pendingClient, pendingClient))
+                {
+                    previous = null;
+                    return false;
+                }
+
+                _pendingClient = null;
+                previous = _connection;
+                _connection = connection;
+                return true;
+            }
+        }
+
+        private void ClearPendingClient(TcpClient pendingClient)
+        {
+            if (pendingClient == null)
+                return;
+
+            lock (_stateLock)
+            {
+                if (ReferenceEquals(_pendingClient, pendingClient))
+                    _pendingClient = null;
+            }
+        }
+
+        private bool IsCurrentConnection(AuthenticatedConnection connection)
+        {
+            lock (_stateLock)
+            {
+                return _running && ReferenceEquals(_connection, connection);
+            }
+        }
+
+        private void RemoveConnection(AuthenticatedConnection connection)
+        {
+            lock (_stateLock)
+            {
+                if (ReferenceEquals(_connection, connection))
+                    _connection = null;
+            }
+
+            connection.Dispose();
         }
     }
 }

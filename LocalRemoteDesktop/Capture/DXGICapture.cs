@@ -1,7 +1,6 @@
 using System;
 using System.Runtime.InteropServices;
 using SharpDX;
-using SharpDX.Direct3D;
 using SharpDX.Direct3D11;
 using SharpDX.DXGI;
 using Device = SharpDX.Direct3D11.Device;
@@ -13,8 +12,6 @@ namespace LocalRemoteDesktop.Capture
     /// <summary>
     /// DXGI Desktop Duplication 屏幕捕获
     /// 延迟 ~8ms（vs GDI BitBlt 的 ~38ms），与 VSync 对齐
-    ///
-    /// 使用 SharpDX（.NET Framework 4.x 上最成熟的 DXGI 封装）
     /// </summary>
     public class DXGICapture : IDisposable
     {
@@ -22,6 +19,8 @@ namespace LocalRemoteDesktop.Capture
         private DeviceContext _context;
         private OutputDuplication _duplication;
         private Texture2D _stagingTex;
+        private int _adapterOutputIndex = -1;
+        private bool _frameAcquired;
         private bool _disposed;
 
         public int Width { get; private set; }
@@ -32,24 +31,26 @@ namespace LocalRemoteDesktop.Capture
         /// <summary>初始化 DXGI 拷贝</summary>
         public bool Initialize(int monitorIndex = 0)
         {
+            if (_disposed)
+                return false;
+
+            DisposeCaptureResources();
+            MonitorIndex = monitorIndex;
+
             try
             {
-                MonitorIndex = monitorIndex;
-
-                // 1. 创建 D3D11 设备
-                var adapter = GetOutputAdapter(monitorIndex);
-                if (adapter != null)
+                int outputIndex;
+                using (var adapter = GetOutputAdapter(monitorIndex, out outputIndex))
                 {
+                    if (adapter == null)
+                        return false;
+
+                    // 必须在 adapter 仍有效时创建设备；Device 会持有自己的 COM 引用。
                     _device = new Device(adapter, DeviceCreationFlags.BgraSupport);
+                    _context = _device.ImmediateContext;
+                    _adapterOutputIndex = outputIndex;
+                    CreateDuplication();
                 }
-                else
-                {
-                    // 回退到主显示器
-                    _device = new Device(DriverType.Hardware, DeviceCreationFlags.BgraSupport);
-                }
-                _context = _device.ImmediateContext;
-
-                CreateDuplication();
 
                 Initialized = true;
                 return true;
@@ -57,50 +58,70 @@ namespace LocalRemoteDesktop.Capture
             catch (Exception ex)
             {
                 System.Diagnostics.Debug.WriteLine($"[DXGICapture] Init: {ex.Message}");
+                DisposeCaptureResources();
                 return false;
             }
         }
 
         private void CreateDuplication()
         {
+            ReleaseFrameNoThrow();
             _duplication?.Dispose();
+            _duplication = null;
 
             using (var dxgiDevice = _device.QueryInterface<SharpDX.DXGI.Device>())
             using (var adapter = dxgiDevice.GetParent<Adapter>())
+            using (var output = adapter.GetOutput(_adapterOutputIndex))
+            using (var output1 = output.QueryInterface<Output1>())
             {
-                var output = adapter.GetOutput(MonitorIndex);
-                var output1 = output.QueryInterface<Output1>();
                 _duplication = output1.DuplicateOutput(_device);
             }
         }
 
-        private Adapter GetOutputAdapter(int monitorIndex)
+        /// <summary>
+        /// 按 Screen.DeviceName 将显示器映射为所属 adapter 和 adapter 内的 output 索引。
+        /// 返回的 adapter 由调用方释放；选中它之前不会在本方法中 Dispose。
+        /// </summary>
+        private Adapter GetOutputAdapter(int monitorIndex, out int adapterOutputIndex)
         {
-            try
+            adapterOutputIndex = -1;
+            var screens = System.Windows.Forms.Screen.AllScreens;
+            if (monitorIndex < 0 || monitorIndex >= screens.Length)
+                return null;
+
+            string targetDeviceName = screens[monitorIndex].DeviceName;
+            using (var factory = new Factory1())
             {
-                using (var factory = new Factory1())
+                for (int ai = 0; ai < factory.GetAdapterCount1(); ai++)
                 {
-                    for (int ai = 0; ai < factory.GetAdapterCount1(); ai++)
+                    Adapter adapter = null;
+                    try
                     {
-                        var adapter = factory.GetAdapter1(ai);
-                        try
+                        adapter = factory.GetAdapter1(ai);
+                        for (int oi = 0; oi < adapter.GetOutputCount(); oi++)
                         {
-                            for (int oi = 0; oi < adapter.GetOutputCount(); oi++)
+                            using (var output = adapter.GetOutput(oi))
                             {
-                                var output = adapter.GetOutput(oi);
-                                try
+                                var description = output.Description;
+                                if (description.IsAttachedToDesktop &&
+                                    string.Equals(description.DeviceName, targetDeviceName,
+                                        StringComparison.OrdinalIgnoreCase))
                                 {
-                                    if (oi == monitorIndex)
-                                        return adapter;
+                                    adapterOutputIndex = oi;
+                                    var selectedAdapter = adapter;
+                                    adapter = null;
+                                    return selectedAdapter;
                                 }
-                                finally { output.Dispose(); }
                             }
                         }
-                        finally { adapter.Dispose(); }
+                    }
+                    finally
+                    {
+                        adapter?.Dispose();
                     }
                 }
             }
-            catch { }
+
             return null;
         }
 
@@ -113,15 +134,15 @@ namespace LocalRemoteDesktop.Capture
             if (!Initialized || _disposed)
                 return false;
 
+            Resource resource = null;
+            bool acquiredThisCall = false;
+
             try
             {
-                SharpDX.Result result;
                 OutputDuplicateFrameInformation frameInfo;
-                Resource resource;
+                Result result = _duplication.TryAcquireNextFrame(100, out frameInfo, out resource);
 
-                result = _duplication.TryAcquireNextFrame(100, out frameInfo, out resource);
-
-                if (result.Failure || resource == null)
+                if (result.Failure)
                 {
                     if (result.Code == SharpDX.DXGI.ResultCode.WaitTimeout.Result.Code)
                         return false; // 无新帧
@@ -133,7 +154,14 @@ namespace LocalRemoteDesktop.Capture
                     return false;
                 }
 
-                using (resource)
+                acquiredThisCall = true;
+                _frameAcquired = true;
+                if (resource == null)
+                {
+                    ReleaseFrameNoThrow();
+                    return false;
+                }
+
                 using (var texture = resource.QueryInterface<Texture2D>())
                 {
                     var desc = texture.Description;
@@ -153,9 +181,14 @@ namespace LocalRemoteDesktop.Capture
                     _context.CopyResource(texture, _stagingTex);
 
                     // Map 到 CPU
-                    var mapSource = _context.MapSubresource(_stagingTex, 0, MapMode.Read, MapFlags.None);
+                    DataBox mapSource = default(DataBox);
+                    bool mapped = false;
                     try
                     {
+                        mapSource = _context.MapSubresource(
+                            _stagingTex, 0, MapMode.Read, MapFlags.None);
+                        mapped = true;
+
                         int rowPitch = mapSource.RowPitch;
                         int bpp = 4;
                         int stride = Width * bpp;
@@ -180,21 +213,61 @@ namespace LocalRemoteDesktop.Capture
                     }
                     finally
                     {
-                        _context.UnmapSubresource(_stagingTex, 0);
+                        if (mapped)
+                            _context.UnmapSubresource(_stagingTex, 0);
                     }
                 }
             }
-            catch (Exception ex)
+            catch (SharpDXException ex)
             {
+                // Acquire 成功后，后续 Query/Copy/Map/Marshal 任一步异常都必须配对释放帧。
+                bool released = !acquiredThisCall || ReleaseFrameNoThrow();
+                if (!released ||
+                    ex.ResultCode.Code == SharpDX.DXGI.ResultCode.AccessLost.Result.Code)
+                {
+                    Reinitialize();
+                }
+
                 System.Diagnostics.Debug.WriteLine($"[DXGICapture] Acquire: {ex.Message}");
                 return false;
+            }
+            catch (Exception ex)
+            {
+                if (acquiredThisCall && !ReleaseFrameNoThrow())
+                    Reinitialize();
+
+                System.Diagnostics.Debug.WriteLine($"[DXGICapture] Acquire: {ex.Message}");
+                return false;
+            }
+            finally
+            {
+                resource?.Dispose();
             }
         }
 
         /// <summary>释放当前帧</summary>
         public void ReleaseFrame()
         {
-            try { _duplication?.ReleaseFrame(); } catch { }
+            if (!ReleaseFrameNoThrow())
+                Reinitialize();
+        }
+
+        private bool ReleaseFrameNoThrow()
+        {
+            if (!_frameAcquired)
+                return true;
+
+            _frameAcquired = false;
+            try
+            {
+                _duplication?.ReleaseFrame();
+                return true;
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"[DXGICapture] Release: {ex.Message}");
+                return false;
+            }
         }
 
         private Texture2D CreateStagingTexture(int width, int height)
@@ -217,23 +290,37 @@ namespace LocalRemoteDesktop.Capture
 
         private void Reinitialize()
         {
-            _duplication?.Dispose();
-            _duplication = null;
+            if (_disposed)
+                return;
+
+            int monitorIndex = MonitorIndex;
+            Initialize(monitorIndex);
+        }
+
+        private void DisposeCaptureResources()
+        {
+            Initialized = false;
+            ReleaseFrameNoThrow();
+
             _stagingTex?.Dispose();
             _stagingTex = null;
+            _duplication?.Dispose();
+            _duplication = null;
+            _context?.Dispose();
+            _context = null;
+            _device?.Dispose();
+            _device = null;
 
-            try { CreateDuplication(); } catch { }
+            _adapterOutputIndex = -1;
+            Width = 0;
+            Height = 0;
         }
 
         public void Dispose()
         {
             if (_disposed) return;
             _disposed = true;
-            _duplication?.ReleaseFrame();
-            _duplication?.Dispose();
-            _stagingTex?.Dispose();
-            _context?.Dispose();
-            _device?.Dispose();
+            DisposeCaptureResources();
         }
     }
 }

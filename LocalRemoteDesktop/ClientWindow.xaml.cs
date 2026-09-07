@@ -1,10 +1,12 @@
 using System;
+using System.Collections.Concurrent;
 using System.IO;
 using System.Threading;
 using System.Windows;
 using System.Windows.Input;
 using LocalRemoteDesktop.Models;
 using LocalRemoteDesktop.Network;
+using LocalRemoteDesktop.Utils;
 
 namespace LocalRemoteDesktop
 {
@@ -17,6 +19,10 @@ namespace LocalRemoteDesktop
         private System.Windows.Forms.Screen _screen;
         private int _remoteWidth, _remoteHeight; // 远程桌面分辨率
         private bool _statsBarPinned; // F12 固定显示
+        private readonly string _targetHost;
+        private readonly int _targetPort;
+        private string _accessCode;
+        private volatile bool _isClosing;
 
         // 帧率统计
         private int _frameCount;
@@ -24,14 +30,27 @@ namespace LocalRemoteDesktop
         private DateTime _statsResetTime = DateTime.UtcNow;
         private System.Windows.Threading.DispatcherTimer _statsTimer;
         private System.Windows.Threading.DispatcherTimer _hideStatsTimer;
+        private System.Windows.Threading.DispatcherTimer _heartbeatTimer;
         private System.Diagnostics.Stopwatch _latencyWatch = new System.Diagnostics.Stopwatch();
         private long _estimatedLatencyMs;
         private long _lastHeartbeatSentAt; // 上次心跳发送时 Stopwatch ticks
 
-        public ClientWindow()
+        public ClientWindow(string host, int port, string accessCode)
         {
+            if (string.IsNullOrWhiteSpace(host))
+                throw new ArgumentException("远程主机不能为空。", nameof(host));
+            if (port < 1 || port > 65535)
+                throw new ArgumentOutOfRangeException(nameof(port));
+            if (string.IsNullOrWhiteSpace(accessCode))
+                throw new ArgumentException("访问码不能为空。", nameof(accessCode));
+
+            _targetHost = host;
+            _targetPort = port;
+            _accessCode = accessCode;
+
             InitializeComponent();
             _screen = System.Windows.Forms.Screen.PrimaryScreen;
+            Title = $"远程桌面控制 - {_targetHost}:{_targetPort}";
             GoFullscreen();
             BtnToggleFullscreen.Content = "⛶ 窗口化";
 
@@ -53,11 +72,11 @@ namespace LocalRemoteDesktop
 
             // 心跳定时器：每 2 秒发一次，测量往返延迟
             _latencyWatch.Start();
-            var heartbeatTimer = new System.Windows.Threading.DispatcherTimer
+            _heartbeatTimer = new System.Windows.Threading.DispatcherTimer
             {
                 Interval = TimeSpan.FromSeconds(2)
             };
-            heartbeatTimer.Tick += (s, e) =>
+            _heartbeatTimer.Tick += (s, e) =>
             {
                 if (_isConnected)
                 {
@@ -67,7 +86,14 @@ namespace LocalRemoteDesktop
                     _client?.Send(new ProtocolFrame(FrameType.Heartbeat, ts));
                 }
             };
-            heartbeatTimer.Start();
+            _heartbeatTimer.Start();
+
+            _fileTransferThread = new Thread(FileTransferLoop)
+            {
+                IsBackground = true,
+                Name = "FileTransferQueue"
+            };
+            _fileTransferThread.Start();
         }
 
         #region 全屏 / 窗口化切换
@@ -124,11 +150,15 @@ namespace LocalRemoteDesktop
                 _client.FrameReceived += OnFrameReceived;
                 _client.Disconnected += OnDisconnected;
 
-                var ip = App.TargetIp;
-                var port = App.Port;
-
-                if (_client.Connect(ip, port))
+                if (_client.Connect(_targetHost, _targetPort, _accessCode))
                 {
+                    _accessCode = null;
+                    if (_isClosing)
+                    {
+                        _client.Dispose();
+                        return;
+                    }
+
                     _isConnected = true;
                     Dispatcher.Invoke(() =>
                     {
@@ -141,15 +171,30 @@ namespace LocalRemoteDesktop
                 }
                 else
                 {
-                    Dispatcher.Invoke(() =>
+                    if (!_isClosing)
                     {
-                        StatusText.Text = $"无法连接到 {ip}:{port}";
-                    });
+                        Dispatcher.Invoke(() =>
+                        {
+                            StatusText.Text = $"无法连接到 {_targetHost}:{_targetPort}，请检查地址和访问码";
+                        });
+                    }
                 }
             }
             catch (Exception ex)
             {
                 System.Diagnostics.Debug.WriteLine($"[Client] Connect error: {ex.Message}");
+                if (!_isClosing)
+                {
+                    Dispatcher.BeginInvoke(new Action(() =>
+                    {
+                        StatusText.Text = $"连接 {_targetHost}:{_targetPort} 失败";
+                        StatusText.Visibility = Visibility.Visible;
+                    }));
+                }
+            }
+            finally
+            {
+                _accessCode = null;
             }
         }
 
@@ -174,13 +219,20 @@ namespace LocalRemoteDesktop
                     break;
 
                 case FrameType.FileAccept:
-                    Dispatcher.BeginInvoke(new Action(() =>
-                        FileStatusText.Text = "服务端已接受，开始传输..."));
+                    SetFileReply(FileReplyKind.Accepted, null);
                     break;
 
                 case FrameType.FileReject:
-                    Dispatcher.BeginInvoke(new Action(() =>
-                        FileStatusText.Text = "文件传输被拒绝"));
+                    SetFileReply(FileReplyKind.Rejected, DecodeMessage(frame.Payload, "文件传输被拒绝"));
+                    break;
+
+                case FrameType.FileTransferResult:
+                    var succeeded = frame.Payload.Length > 0 && frame.Payload[0] != 0;
+                    var resultMessage = frame.Payload.Length > 1
+                        ? System.Text.Encoding.UTF8.GetString(frame.Payload, 1, frame.Payload.Length - 1)
+                        : null;
+                    SetFileReply(succeeded ? FileReplyKind.Completed : FileReplyKind.Failed,
+                        resultMessage);
                     break;
 
                 case FrameType.Heartbeat:
@@ -233,6 +285,10 @@ namespace LocalRemoteDesktop
         private void OnDisconnected()
         {
             _isConnected = false;
+            SetFileReply(FileReplyKind.Failed, "连接已断开");
+            if (_isClosing || Dispatcher.HasShutdownStarted)
+                return;
+
             Dispatcher.BeginInvoke(new Action(() =>
             {
                 StatusText.Text = "连接已断开";
@@ -330,9 +386,9 @@ namespace LocalRemoteDesktop
             if (!_isConnected) return;
             try
             {
-                if (System.Windows.Clipboard.ContainsText())
+                string text;
+                if (ClipboardHelper.TryGetText(out text))
                 {
-                    var text = System.Windows.Clipboard.GetText();
                     if (!string.IsNullOrEmpty(text) && text != _lastClipboardText)
                     {
                         _lastClipboardText = text;
@@ -349,24 +405,61 @@ namespace LocalRemoteDesktop
             try
             {
                 var text = System.Text.Encoding.UTF8.GetString(frame.Payload);
-                if (!string.IsNullOrEmpty(text) && text != _lastClipboardText)
+                if (string.IsNullOrEmpty(text) || text == _lastClipboardText)
+                    return;
+
+                Dispatcher.BeginInvoke(new Action(() =>
                 {
-                    _lastClipboardText = text;
-                    System.Windows.Clipboard.SetText(text);
-                }
+                    if (_isClosing || text == _lastClipboardText)
+                        return;
+
+                    if (ClipboardHelper.TrySetText(text))
+                        _lastClipboardText = text;
+                }));
             }
             catch { }
         }
 
         private void StopClipboardSync()
         {
-            _clipboardTimer?.Stop();
+            if (_clipboardTimer != null)
+            {
+                _clipboardTimer.Stop();
+                _clipboardTimer.Tick -= PollClipboard;
+            }
             _clipboardTimer = null;
         }
 
         #endregion
 
         #region 文件传输
+
+        private sealed class FileTransferItem
+        {
+            public string FilePath { get; set; }
+            public string RelativePath { get; set; }
+            public bool IsFolderFile { get; set; }
+        }
+
+        private enum FileReplyKind
+        {
+            None,
+            Accepted,
+            Rejected,
+            Completed,
+            Failed,
+            TimedOut
+        }
+
+        private readonly BlockingCollection<FileTransferItem> _fileQueue =
+            new BlockingCollection<FileTransferItem>();
+        private readonly CancellationTokenSource _fileTransferCancellation =
+            new CancellationTokenSource();
+        private readonly AutoResetEvent _fileReplyEvent = new AutoResetEvent(false);
+        private readonly object _fileReplyLock = new object();
+        private Thread _fileTransferThread;
+        private FileReplyKind _fileReplyKind;
+        private string _fileReplyMessage;
 
         private void OnSendFile(object sender, RoutedEventArgs e)
         {
@@ -386,71 +479,246 @@ namespace LocalRemoteDesktop
             if (dialog.ShowDialog() == true)
             {
                 foreach (var file in dialog.FileNames)
-                    SendFile(file);
+                    QueueFile(file, Path.GetFileName(file), false);
             }
         }
 
         private void SendFile(string filePath)
         {
-            SendFileInternal(filePath, Path.GetFileName(filePath));
+            QueueFile(filePath, Path.GetFileName(filePath), false);
         }
 
-        /// <summary>发送文件/文件夹内文件（relativePath 用于服务端创建子目录）</summary>
-        private void SendFileInternal(string filePath, string relativePath)
+        private void QueueFile(string filePath, string relativePath, bool isFolderFile)
         {
-            var fileInfo = new FileInfo(filePath);
+            if (_isClosing || !File.Exists(filePath))
+                return;
 
-            // payload: [8字节大小][1字节标志：0=独立, 1=文件夹内][UTF8 相对路径]
-            var pathBytes = System.Text.Encoding.UTF8.GetBytes(relativePath);
-            var requestPayload = new byte[9 + pathBytes.Length];
-            Buffer.BlockCopy(BitConverter.GetBytes(fileInfo.Length), 0, requestPayload, 0, 8);
-            requestPayload[8] = 0; // 默认独立文件标志
-            Buffer.BlockCopy(pathBytes, 0, requestPayload, 9, pathBytes.Length);
-            _client?.Send(new ProtocolFrame(FrameType.FileRequest, requestPayload));
-
-            FileStatusText.Text = $"发送: {relativePath} ({FormatSize(fileInfo.Length)})";
-
-            ThreadPool.QueueUserWorkItem(_ =>
+            var item = new FileTransferItem
             {
-                try
-                {
-                    const int chunkSize = 256 * 1024;
-                    long totalSent = 0;
+                FilePath = filePath,
+                RelativePath = relativePath,
+                IsFolderFile = isFolderFile
+            };
 
-                    using (var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read))
+            if (_fileQueue.TryAdd(item))
+                SetFileStatus($"已排队: {relativePath}（队列 {_fileQueue.Count}）");
+        }
+
+        private void FileTransferLoop()
+        {
+            try
+            {
+                foreach (var item in _fileQueue.GetConsumingEnumerable(
+                    _fileTransferCancellation.Token))
+                {
+                    if (_fileTransferCancellation.IsCancellationRequested)
+                        break;
+
+                    TransferFile(item);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+            }
+        }
+
+        private void TransferFile(FileTransferItem item)
+        {
+            var requestAccepted = false;
+            var endSent = false;
+
+            try
+            {
+                if (!_isConnected)
+                {
+                    SetFileStatus($"发送失败: {item.RelativePath}（连接已断开）");
+                    return;
+                }
+
+                var fileInfo = new FileInfo(item.FilePath);
+                var pathBytes = System.Text.Encoding.UTF8.GetBytes(item.RelativePath);
+                var requestPayload = new byte[9 + pathBytes.Length];
+                Buffer.BlockCopy(BitConverter.GetBytes(fileInfo.Length), 0, requestPayload, 0, 8);
+                requestPayload[8] = item.IsFolderFile ? (byte)1 : (byte)0;
+                Buffer.BlockCopy(pathBytes, 0, requestPayload, 9, pathBytes.Length);
+
+                ResetFileReply();
+                SetFileStatus($"请求发送: {item.RelativePath} ({FormatSize(fileInfo.Length)})");
+                _client?.Send(new ProtocolFrame(FrameType.FileRequest, requestPayload));
+
+                string replyMessage;
+                var reply = WaitForFileReply(false, 15000, out replyMessage);
+                if (reply != FileReplyKind.Accepted)
+                {
+                    SetFileStatus($"发送失败: {item.RelativePath}（{ReplyText(reply, replyMessage)}）");
+                    return;
+                }
+
+                requestAccepted = true;
+                SetFileStatus($"发送: {item.RelativePath} 0%");
+
+                const int chunkSize = 256 * 1024;
+                long totalSent = 0;
+                var buffer = new byte[chunkSize];
+                var sequence = 0;
+
+                using (var stream = new FileStream(item.FilePath, FileMode.Open, FileAccess.Read,
+                    FileShare.Read, chunkSize, FileOptions.SequentialScan))
+                {
+                    while (true)
                     {
-                        byte[] buffer = new byte[chunkSize];
-                        int seq = 0;
+                        _fileTransferCancellation.Token.ThrowIfCancellationRequested();
+                        if (!_isConnected)
+                            throw new IOException("连接已断开");
 
-                        while (true)
-                        {
-                            int read = fs.Read(buffer, 0, buffer.Length);
-                            if (read <= 0) break;
+                        var read = stream.Read(buffer, 0, buffer.Length);
+                        if (read <= 0)
+                            break;
 
-                            var payload = new byte[4 + read];
-                            Buffer.BlockCopy(BitConverter.GetBytes(seq++), 0, payload, 0, 4);
-                            Buffer.BlockCopy(buffer, 0, payload, 4, read);
+                        var payload = new byte[4 + read];
+                        Buffer.BlockCopy(BitConverter.GetBytes(sequence++), 0, payload, 0, 4);
+                        Buffer.BlockCopy(buffer, 0, payload, 4, read);
+                        _client?.Send(new ProtocolFrame(FrameType.FileData, payload));
+                        totalSent += read;
 
-                            _client?.Send(new ProtocolFrame(FrameType.FileData, payload));
-                            totalSent += read;
+                        var progress = fileInfo.Length == 0
+                            ? 100
+                            : (int)(totalSent * 100 / fileInfo.Length);
+                        SetFileStatus($"发送: {item.RelativePath} {progress}%");
 
-                            var progress = (int)(totalSent * 100 / fileInfo.Length);
-                            Dispatcher.BeginInvoke(new Action(() =>
-                                FileStatusText.Text = $"发送: {relativePath} {progress}%"));
-                        }
+                        FileReplyKind currentReply;
+                        lock (_fileReplyLock)
+                            currentReply = _fileReplyKind;
+                        if (currentReply == FileReplyKind.Failed ||
+                            currentReply == FileReplyKind.Rejected)
+                            break;
                     }
-
-                    _client?.Send(new ProtocolFrame(FrameType.FileEnd, Array.Empty<byte>()));
-
-                    Dispatcher.BeginInvoke(new Action(() =>
-                        FileStatusText.Text = $"✅ 发送完成: {relativePath}"));
                 }
-                catch (Exception ex)
+
+                _client?.Send(new ProtocolFrame(FrameType.FileEnd, Array.Empty<byte>()));
+                endSent = true;
+
+                reply = WaitForFileReply(true, 30000, out replyMessage);
+                if (reply == FileReplyKind.Completed)
                 {
-                    Dispatcher.BeginInvoke(new Action(() =>
-                        FileStatusText.Text = $"❌ 发送失败: {ex.Message}"));
+                    SetFileStatus(string.IsNullOrWhiteSpace(replyMessage)
+                        ? $"发送完成: {item.RelativePath}"
+                        : replyMessage);
                 }
-            });
+                else
+                {
+                    SetFileStatus($"发送失败: {item.RelativePath}（{ReplyText(reply, replyMessage)}）");
+                }
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch (Exception ex)
+            {
+                SetFileStatus($"发送失败: {item.RelativePath}（{ex.Message}）");
+            }
+            finally
+            {
+                // 本地读取中途失败时也发送结束帧，让服务端校验失败并清理临时文件。
+                if (requestAccepted && !endSent && _isConnected &&
+                    !_fileTransferCancellation.IsCancellationRequested)
+                {
+                    _client?.Send(new ProtocolFrame(FrameType.FileEnd, Array.Empty<byte>()));
+                }
+            }
+        }
+
+        private void ResetFileReply()
+        {
+            lock (_fileReplyLock)
+            {
+                _fileReplyKind = FileReplyKind.None;
+                _fileReplyMessage = null;
+            }
+
+            while (_fileReplyEvent.WaitOne(0))
+            {
+            }
+        }
+
+        private void SetFileReply(FileReplyKind kind, string message)
+        {
+            lock (_fileReplyLock)
+            {
+                _fileReplyKind = kind;
+                _fileReplyMessage = message;
+            }
+            _fileReplyEvent.Set();
+        }
+
+        private FileReplyKind WaitForFileReply(bool waitForCompletion, int timeoutMilliseconds,
+            out string message)
+        {
+            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+            while (!_fileTransferCancellation.IsCancellationRequested)
+            {
+                FileReplyKind kind;
+                lock (_fileReplyLock)
+                {
+                    kind = _fileReplyKind;
+                    message = _fileReplyMessage;
+                }
+
+                if (waitForCompletion)
+                {
+                    if (kind == FileReplyKind.Completed || kind == FileReplyKind.Failed ||
+                        kind == FileReplyKind.Rejected)
+                        return kind;
+                }
+                else if (kind == FileReplyKind.Accepted || kind == FileReplyKind.Rejected ||
+                    kind == FileReplyKind.Failed)
+                {
+                    return kind;
+                }
+
+                var remaining = timeoutMilliseconds - (int)stopwatch.ElapsedMilliseconds;
+                if (remaining <= 0)
+                    break;
+                _fileReplyEvent.WaitOne(Math.Min(remaining, 250));
+            }
+
+            message = _fileTransferCancellation.IsCancellationRequested
+                ? "传输已取消"
+                : "等待服务端响应超时";
+            return FileReplyKind.TimedOut;
+        }
+
+        private static string ReplyText(FileReplyKind kind, string message)
+        {
+            if (!string.IsNullOrWhiteSpace(message))
+                return message;
+            if (kind == FileReplyKind.Rejected)
+                return "服务端拒绝接收";
+            if (kind == FileReplyKind.TimedOut)
+                return "等待服务端响应超时";
+            return "服务端未确认保存成功";
+        }
+
+        private static string DecodeMessage(byte[] payload, string fallback)
+        {
+            if (payload == null || payload.Length == 0)
+                return fallback;
+            try
+            {
+                var message = System.Text.Encoding.UTF8.GetString(payload);
+                return string.IsNullOrWhiteSpace(message) ? fallback : message;
+            }
+            catch
+            {
+                return fallback;
+            }
+        }
+
+        private void SetFileStatus(string text)
+        {
+            if (_isClosing || Dispatcher.HasShutdownStarted)
+                return;
+            Dispatcher.BeginInvoke(new Action(() => FileStatusText.Text = text));
         }
 
         private void SendFolder(string folderPath)
@@ -464,7 +732,7 @@ namespace LocalRemoteDesktop
                 // 计算相对路径（含文件夹名）
                 var relativePath = folderName + "\\" +
                     file.Substring(folderPath.Length).TrimStart('\\', '/');
-                SendFileInternal(file, relativePath);
+                QueueFile(file, relativePath, true);
             }
         }
 
@@ -637,7 +905,30 @@ namespace LocalRemoteDesktop
 
         private void OnClosed(object sender, EventArgs e)
         {
-            _client?.Dispose();
+            _isClosing = true;
+            _isConnected = false;
+
+            _statsTimer?.Stop();
+            if (_statsTimer != null)
+                _statsTimer.Tick -= UpdateStats;
+            _heartbeatTimer?.Stop();
+            _hideStatsTimer?.Stop();
+            StopClipboardSync();
+            _latencyWatch.Stop();
+
+            _fileTransferCancellation.Cancel();
+            _fileQueue.CompleteAdding();
+            SetFileReply(FileReplyKind.Failed, "窗口已关闭");
+
+            if (_client != null)
+            {
+                _client.FrameReceived -= OnFrameReceived;
+                _client.Disconnected -= OnDisconnected;
+                _client.Dispose();
+            }
+
+            if (_fileTransferThread != null && _fileTransferThread.IsAlive)
+                _fileTransferThread.Join(500);
         }
     }
 }

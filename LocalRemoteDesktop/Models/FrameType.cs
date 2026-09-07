@@ -47,6 +47,9 @@ namespace LocalRemoteDesktop.Models
         /// <summary>剪贴板文本同步 (双向) payload: UTF8文本</summary>
         ClipboardText = 0x15,
 
+        /// <summary>文件传输最终结果 (Server → Client)</summary>
+        FileTransferResult = 0x16,
+
         /// <summary>心跳</summary>
         Heartbeat = 0xFF,
 
@@ -60,5 +63,22 @@ namespace LocalRemoteDesktop.Models
 
         /// <summary>Tile本帧发送完毕 (Server → Client) 通知客户端刷新画面</summary>
         TileEnd = 0x22,
+
+        // ---- 安全握手与加密信道（不得作为业务帧直接分发）----
+
+        /// <summary>客户端握手问候</summary>
+        ClientHello = 0xE0,
+
+        /// <summary>服务端随机挑战与身份凭据</summary>
+        ServerChallenge = 0xE1,
+
+        /// <summary>客户端挑战响应</summary>
+        ClientProof = 0xE2,
+
+        /// <summary>服务端确认认证完成</summary>
+        ServerProof = 0xE3,
+
+        /// <summary>认证后的加密业务帧外层</summary>
+        SecureData = 0xE4,
     }
 }

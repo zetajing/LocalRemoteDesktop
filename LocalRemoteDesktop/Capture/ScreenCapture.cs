@@ -34,6 +34,8 @@ namespace LocalRemoteDesktop.Capture
         private DXGICapture _dxgiCapture;
         private byte[] _previousFrame; // 用于变化检测的缓存
         private bool _firstFrame = true;
+        private DateTime _nextDxgiRetryUtc = DateTime.MinValue;
+        private static readonly TimeSpan DxgiRetryDelay = TimeSpan.FromSeconds(5);
 
         /// <summary>分辨率是否在上次捕获后改变</summary>
         public bool SizeChanged { get; private set; }
@@ -79,6 +81,7 @@ namespace LocalRemoteDesktop.Capture
                 _dxgiCapture = null;
                 _previousFrame = null;
                 _firstFrame = true;
+                _nextDxgiRetryUtc = DateTime.MinValue;
             }
         }
 
@@ -99,13 +102,22 @@ namespace LocalRemoteDesktop.Capture
                 // 1. 延迟初始化 DXGI
                 if (_dxgiCapture == null || !_dxgiCapture.Initialized)
                 {
+                    DateTime now = DateTime.UtcNow;
+                    if (now < _nextDxgiRetryUtc)
+                        return FallbackCapture();
+
                     _dxgiCapture?.Dispose();
                     _dxgiCapture = new DXGICapture();
                     if (!_dxgiCapture.Initialize(_monitorIndex))
                     {
-                        // 回退到旧版 GDI
+                        // DXGI 不可用时回退 GDI，并限流重试，避免每帧反复创建设备。
+                        _dxgiCapture.Dispose();
+                        _dxgiCapture = null;
+                        _nextDxgiRetryUtc = now.Add(DxgiRetryDelay);
                         return FallbackCapture();
                     }
+
+                    _nextDxgiRetryUtc = DateTime.MinValue;
                 }
 
                 // 2. 捕获帧
